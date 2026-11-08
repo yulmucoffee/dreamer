@@ -1,4 +1,5 @@
 import argparse
+import subprocess
 import sys
 from pathlib import Path
 from dreamer.config import DreamerConfig
@@ -6,12 +7,26 @@ from dreamer.memory import MemoryManager
 from dreamer.consolidator import Consolidator
 from dreamer.llm import DreamError
 
-HOOK_TEMPLATE = """#!/usr/bin/env bash
-# dreamer post-commit hook: runs background memory dreaming
+HOOK_MARKER = "# dreamer hook: runs background memory dreaming"
+
+HOOK_TEMPLATE = f"""#!/usr/bin/env bash
+{HOOK_MARKER}
 if command -v dreamer >/dev/null 2>&1; then
-    (dreamer run --quiet >/dev/null 2>&1 &)
+    log="$(git rev-parse --git-dir)/dreamer.log"
+    (dreamer run --quiet >>"$log" 2>&1 &)
 fi
 """
+
+
+def resolve_hook_path(repo_dir: Path, hook_type: str):
+    """Hook path as git sees it: honors worktrees (.git file) and core.hooksPath."""
+    res = subprocess.run(
+        ["git", "rev-parse", "--git-path", f"hooks/{hook_type}"],
+        cwd=repo_dir, capture_output=True, text=True,
+    )
+    if res.returncode != 0:
+        return None
+    return (repo_dir / res.stdout.strip()).resolve()
 
 CURSORRULES_TEMPLATE = """# Cursor Agent Rules
 - Always consult `MEMORY.md` before making architectural assumptions.
@@ -107,13 +122,16 @@ def main():
         mgr.ensure_structure()
 
         # Install git hook
-        git_dir = repo_dir / ".git"
-        if git_dir.exists() and config.hook.hook_type != "none":
-            hook_file = git_dir / "hooks" / config.hook.hook_type
+        hook_file = resolve_hook_path(repo_dir, config.hook.hook_type) if config.hook.hook_type != "none" else None
+        if hook_file and hook_file.exists() and HOOK_MARKER not in hook_file.read_text(encoding="utf-8", errors="replace"):
+            # Never clobber a user's (or husky/pre-commit's) existing hook.
+            print(f"[dreamer] Warning: {hook_file} already exists; not overwriting. "
+                  f"Add this line to it to enable dreaming: (dreamer run --quiet >/dev/null 2>&1 &)", file=sys.stderr)
+        elif hook_file:
             hook_file.parent.mkdir(parents=True, exist_ok=True)
             hook_file.write_text(HOOK_TEMPLATE, encoding="utf-8")
             hook_file.chmod(0o755)
-            print(f"[dreamer] Installed git {config.hook.hook_type} hook.")
+            print(f"[dreamer] Installed git {config.hook.hook_type} hook at {hook_file}.")
 
         # Create Agent templates
         if args.agent in ("claude", "all"):
