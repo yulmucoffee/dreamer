@@ -1,3 +1,4 @@
+import os
 import re
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
@@ -32,7 +33,10 @@ class MemoryManager:
         return self.memory_file.read_text(encoding="utf-8")
 
     def write_index(self, content: str):
-        self.memory_file.write_text(content, encoding="utf-8")
+        # Atomic replace so a crash or a concurrent hook run never leaves a half-written index.
+        tmp = self.memory_file.with_name(f".{self.memory_file.name}.{os.getpid()}.tmp")
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, self.memory_file)
 
     def check_limits(self, content: Optional[str] = None) -> Tuple[bool, int, int]:
         if content is None:
@@ -61,13 +65,3 @@ class MemoryManager:
                 if not target.exists():
                     issues.append({"text": text, "link": link, "status": "missing"})
         return issues
-
-    def prune_and_truncate(self, content: str) -> str:
-        """If content exceeds max_lines, safely prune older trailing lines."""
-        lines = content.splitlines()
-        if len(lines) <= self.config.max_lines:
-            return content
-
-        truncated = lines[: self.config.max_lines - 4]
-        truncated.append("\n<!-- Auto-pruned by dreamer: exceeded max line limit. Archive details to topics. -->")
-        return "\n".join(truncated)

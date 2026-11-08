@@ -1,10 +1,10 @@
 import argparse
 import sys
-import json
 from pathlib import Path
 from dreamer.config import DreamerConfig
 from dreamer.memory import MemoryManager
 from dreamer.consolidator import Consolidator
+from dreamer.llm import DreamError
 
 HOOK_TEMPLATE = """#!/usr/bin/env bash
 # dreamer post-commit hook: runs background memory dreaming
@@ -29,28 +29,21 @@ CLAUDE_MD_TEMPLATE = """# Claude Code Agent Rules
 
 EXAMPLE_TOML_CONFIG = """# dreamer.toml - Agent Memory Configuration
 
-# Presets: "vibe" (zero-config, silent background), "strict" (hard verification), "local" (offline), "custom"
-preset = "vibe"
-
 [memory]
 index_file = "MEMORY.md"
 topics_dir = "memory"
 max_lines = 200
 max_bytes = 25600
-archive_threshold = 180
 
 [model]
-# Provider: "auto", "anthropic", "openai", "ollama", "heuristic"
-provider = "auto"
-model = "claude-3-5-haiku-20241022"
-api_key_env = "ANTHROPIC_API_KEY"
-# base_url = "http://localhost:11434/v1" # for Ollama or custom endpoints
-temperature = 0.2
+# Dreaming runs on Claude via the Anthropic API. Credentials are resolved from
+# ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, or an `ant auth login` profile.
+model = "claude-opus-5-5"
+effort = "high"  # low | medium | high | xhigh | max
+max_tokens = 64000
 
 [hook]
-hook_type = "post-commit"
-run_background = true
-quiet = true
+hook_type = "post-commit"  # post-commit | pre-push | none
 
 [rules]
 focus_areas = [
@@ -58,12 +51,6 @@ focus_areas = [
     "runtime_gotchas",
     "architectural_decisions",
     "verified_bugfix_rules"
-]
-ignore_files = [
-    "*.lock",
-    "node_modules/**",
-    "dist/**",
-    "build/**"
 ]
 """
 
@@ -78,12 +65,6 @@ def main():
     # init
     init_p = subparsers.add_parser("init", help="Initialize agent memory and hooks for current repository")
     init_p.add_argument("--repo-dir", default=".", help="Target repository directory (default: current dir)")
-    init_p.add_argument(
-        "--preset",
-        choices=["vibe", "strict", "local", "custom"],
-        default="vibe",
-        help="Setup preset (default: vibe - zero-friction background)",
-    )
     init_p.add_argument(
         "--agent",
         choices=["claude", "cursor", "all", "none"],
@@ -122,9 +103,6 @@ def main():
     config = DreamerConfig.load(repo_dir)
 
     if args.command == "init":
-        if args.preset != "vibe":
-            config = DreamerConfig.from_preset(args.preset)
-
         mgr = MemoryManager(repo_dir, config.memory)
         mgr.ensure_structure()
 
@@ -150,13 +128,13 @@ def main():
                 cursor_file.write_text(CURSORRULES_TEMPLATE, encoding="utf-8")
                 print("[dreamer] Created .cursorrules")
 
-        if args.with_config or args.preset == "custom":
+        if args.with_config:
             cfg_file = repo_dir / "dreamer.toml"
             if not cfg_file.exists():
                 cfg_file.write_text(EXAMPLE_TOML_CONFIG, encoding="utf-8")
                 print("[dreamer] Created dreamer.toml")
 
-        print(f"[dreamer] Setup complete (Preset: {args.preset}) in {repo_dir}")
+        print(f"[dreamer] Setup complete in {repo_dir}")
 
     elif args.command == "check":
         mgr = MemoryManager(repo_dir, config.memory)
@@ -189,7 +167,11 @@ def main():
         if args.trace_file and Path(args.trace_file).exists():
             trace_data = Path(args.trace_file).read_text(encoding="utf-8")
 
-        new_index = consolidator.dream(session_trace=trace_data, dry_run=args.dry_run)
+        try:
+            new_index = consolidator.dream(session_trace=trace_data, dry_run=args.dry_run, commit_count=args.commits)
+        except DreamError as e:
+            print(f"[dreamer] Dream aborted, {config.memory.index_file} left unchanged: {e}", file=sys.stderr)
+            sys.exit(1)
 
         if args.dry_run:
             print("--- [Dry Run Preview: Updated MEMORY.md] ---")
@@ -203,10 +185,9 @@ def main():
             cfg_file.write_text(EXAMPLE_TOML_CONFIG, encoding="utf-8")
             print(f"[dreamer] Created config template at {cfg_file}")
         elif args.config_command == "show":
-            print(f"[dreamer] Active Preset: {config.preset}")
             print(f"  - Memory Index: {config.memory.index_file} (max {config.memory.max_lines} lines)")
-            print(f"  - Model Provider: {config.model.provider} ({config.model.model})")
-            print(f"  - Git Hook: {config.hook.hook_type} (bg: {config.hook.run_background})")
+            print(f"  - Model: {config.model.model} (effort: {config.model.effort})")
+            print(f"  - Git Hook: {config.hook.hook_type}")
             print(f"  - Focus Areas: {', '.join(config.rules.focus_areas)}")
 
 

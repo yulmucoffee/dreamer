@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Optional
 from dreamer.config import DreamerConfig
 from dreamer.memory import MemoryManager
-from dreamer.llm import get_provider
+from dreamer.llm import DreamError, complete
 
 
 def build_system_prompt(config: DreamerConfig) -> str:
@@ -65,10 +65,11 @@ class Consolidator:
 
         return "\n\n".join(ctx_parts)
 
-    def dream(self, session_trace: Optional[str] = None, dry_run: bool = False) -> str:
+    def dream(self, session_trace: Optional[str] = None, dry_run: bool = False, commit_count: int = 5) -> str:
+        """Produce a new index. Raises DreamError (and writes nothing) on any failure."""
         self.mgr.ensure_structure()
         current_index = self.mgr.read_index()
-        recent_ctx = self.collect_recent_context()
+        recent_ctx = self.collect_recent_context(commit_count)
 
         full_input = f"## Current {self.config.memory.index_file}:\n```markdown\n{current_index}\n```\n\n"
         if session_trace:
@@ -77,27 +78,26 @@ class Consolidator:
             full_input += f"## Git Context:\n{recent_ctx}\n\n"
 
         system_prompt = build_system_prompt(self.config)
-        provider = get_provider(self.config.model)
+        new_index = strip_outer_fence(complete(self.config.model, system_prompt, full_input))
 
-        try:
-            new_index = provider.complete(system_prompt, full_input)
-        except Exception as e:
-            # Graceful fallback: do not crash the developer's git hook
-            print(f"[dreamer] LLM generation error ({e}), falling back to safe compaction.", flush=True)
-            new_index = self.mgr.prune_and_truncate(current_index)
-
-        # Strip markdown fences if wrapped
-        if new_index.startswith("```markdown"):
-            new_index = new_index[len("```markdown"):].strip()
-        if new_index.startswith("```"):
-            new_index = new_index[len("```"):].strip()
-        if new_index.endswith("```"):
-            new_index = new_index[:-3].strip()
-
-        # Enforce hard line limit safeguard
-        new_index = self.mgr.prune_and_truncate(new_index)
+        # Never truncate: cutting lines off the end silently deletes memory.
+        # An over-limit result is rejected and the existing index is kept.
+        is_valid, lines, size = self.mgr.check_limits(new_index)
+        if not is_valid:
+            raise DreamError(
+                f"new index exceeds limits ({lines} lines / {size} bytes, "
+                f"max {self.config.memory.max_lines} / {self.config.memory.max_bytes}); keeping existing index"
+            )
 
         if not dry_run:
-            self.mgr.write_index(new_index)
+            self.mgr.write_index(new_index + "\n")
 
         return new_index
+
+
+def strip_outer_fence(text: str) -> str:
+    """Remove a code fence only when it wraps the entire output."""
+    lines = text.strip().splitlines()
+    if len(lines) >= 2 and lines[0].startswith("```") and lines[-1].strip() == "```":
+        return "\n".join(lines[1:-1]).strip()
+    return text.strip()
