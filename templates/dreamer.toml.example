@@ -1,0 +1,38 @@
+# dreamer.toml - Agent Memory Configuration Example
+
+# Presets: "vibe" (zero-config, silent background), "strict" (hard verification), "local" (offline), "custom"
+preset = "vibe"
+
+[memory]
+index_file = "MEMORY.md"
+topics_dir = "memory"
+max_lines = 200
+max_bytes = 25600
+archive_threshold = 180
+
+[model]
+# Provider options: "auto", "anthropic", "openai", "ollama", "heuristic"
+provider = "auto"
+model = "claude-3-5-haiku-20241022"
+api_key_env = "ANTHROPIC_API_KEY"
+# base_url = "http://localhost:11434/v1" # for Ollama or custom OpenAI-compatible endpoints
+temperature = 0.2
+
+[hook]
+hook_type = "post-commit"
+run_background = true
+quiet = true
+
+[rules]
+focus_areas = [
+    "core_invariants",
+    "runtime_gotchas",
+    "architectural_decisions",
+    "verified_bugfix_rules"
+]
+ignore_files = [
+    "*.lock",
+    "node_modules/**",
+    "dist/**",
+    "build/**"
+]

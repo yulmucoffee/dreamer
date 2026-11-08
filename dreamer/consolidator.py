@@ -1,40 +1,45 @@
-import os
 import subprocess
 from pathlib import Path
 from typing import Optional
-from dreamer.memory import MemoryManager, MAX_INDEX_LINES
+from dreamer.config import DreamerConfig
+from dreamer.memory import MemoryManager
+from dreamer.llm import get_provider
 
-DREAM_SYSTEM_PROMPT = """You are an Agent Memory Dreaming Engine.
+
+def build_system_prompt(config: DreamerConfig) -> str:
+    focus_str = ", ".join(config.rules.focus_areas)
+    return f"""You are an Agent Memory Dreaming Engine.
 Your job is offline memory consolidation (sleep-time compute) for an AI coding agent, based on Anthropic's "The components of agent memory".
 
 Core Principles:
 1. Memory is a prediction of future utility, not a diary of past actions.
 2. Never record transient state (e.g., 'modified file X', 'tests currently failing').
 3. Only record persistent invariants, non-obvious failure modes, and verified resolution rules.
-4. The output index MUST fit within 200 lines (or 25KB). Offload detailed reference material into topic files if needed.
+4. The output index MUST fit within {config.memory.max_lines} lines (or {config.memory.max_bytes // 1024}KB).
+5. Offload detailed reference material into topic files (`{config.memory.topics_dir}/<topic>.md`) if needed.
 
-Input:
-- Current MEMORY.md
-- Recent session trace, git commits, or git diffs
+Current Focus Areas:
+{focus_str}
 
 Task:
-Refactor and update MEMORY.md:
+Refactor and update `{config.memory.index_file}`:
 - Extract newly verified invariants and rules from recent work.
 - Resolve any contradictions or outdated entries.
-- If content grows beyond 200 lines, summarize the top-level index and suggest topic files to archive.
-Output the exact new MEMORY.md content.
+- Maintain a clean, scannable index with pointers to deep topic files.
+Output ONLY the markdown content of the new index.
 """
 
 
 class Consolidator:
-    def __init__(self, memory_mgr: MemoryManager):
+    def __init__(self, memory_mgr: MemoryManager, config: DreamerConfig):
         self.mgr = memory_mgr
+        self.config = config
 
-    def collect_recent_context(self) -> str:
+    def collect_recent_context(self, commit_count: int = 5) -> str:
         ctx_parts = []
         try:
             log_res = subprocess.run(
-                ["git", "log", "-n", "5", "--oneline"],
+                ["git", "log", f"-n{commit_count}", "--oneline"],
                 cwd=self.mgr.root_dir,
                 capture_output=True,
                 text=True,
@@ -45,8 +50,10 @@ class Consolidator:
             pass
 
         try:
+            # Build diff excluding ignored files
+            cmd = ["git", "diff", "HEAD~1", "HEAD", "--stat"]
             diff_res = subprocess.run(
-                ["git", "diff", "HEAD~1", "HEAD", "--stat"],
+                cmd,
                 cwd=self.mgr.root_dir,
                 capture_output=True,
                 text=True,
@@ -58,37 +65,27 @@ class Consolidator:
 
         return "\n\n".join(ctx_parts)
 
-    def dream(self, session_trace: Optional[str] = None) -> bool:
+    def dream(self, session_trace: Optional[str] = None, dry_run: bool = False) -> str:
         self.mgr.ensure_structure()
         current_index = self.mgr.read_index()
         recent_ctx = self.collect_recent_context()
 
-        full_input = f"## Current MEMORY.md:\n```markdown\n{current_index}\n```\n\n"
+        full_input = f"## Current {self.config.memory.index_file}:\n```markdown\n{current_index}\n```\n\n"
         if session_trace:
             full_input += f"## Recent Session Trace:\n```\n{session_trace}\n```\n\n"
         if recent_ctx:
             full_input += f"## Git Context:\n{recent_ctx}\n\n"
 
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            # Fallback heuristic mode: check and enforce 200 line limit
-            lines = current_index.splitlines()
-            if len(lines) > MAX_INDEX_LINES:
-                trimmed = lines[:MAX_INDEX_LINES - 5]
-                trimmed.append("\n<!-- Auto-pruned by dreamer: exceeded 200 lines limit. -->")
-                self.mgr.write_index("\n".join(trimmed))
-            return True
+        system_prompt = build_system_prompt(self.config)
+        provider = get_provider(self.config.model)
 
-        import anthropic
-        client = anthropic.Anthropic(api_key=api_key)
-        resp = client.messages.create(
-            model=os.environ.get("DREAMER_MODEL", "claude-3-5-haiku-20241022"),
-            max_tokens=4096,
-            system=DREAM_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": full_input}],
-        )
+        try:
+            new_index = provider.complete(system_prompt, full_input)
+        except Exception as e:
+            # Graceful fallback: do not crash the developer's git hook
+            print(f"[dreamer] LLM generation error ({e}), falling back to safe compaction.", flush=True)
+            new_index = self.mgr.prune_and_truncate(current_index)
 
-        new_index = resp.content[0].text.strip()
         # Strip markdown fences if wrapped
         if new_index.startswith("```markdown"):
             new_index = new_index[len("```markdown"):].strip()
@@ -97,6 +94,10 @@ class Consolidator:
         if new_index.endswith("```"):
             new_index = new_index[:-3].strip()
 
-        is_valid, lcount, bcount = self.mgr.check_limits(new_index)
-        self.mgr.write_index(new_index)
-        return is_valid
+        # Enforce hard line limit safeguard
+        new_index = self.mgr.prune_and_truncate(new_index)
+
+        if not dry_run:
+            self.mgr.write_index(new_index)
+
+        return new_index

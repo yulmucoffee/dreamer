@@ -1,28 +1,28 @@
+import re
 from pathlib import Path
-from typing import List, Tuple
-
-MAX_INDEX_LINES = 200
-MAX_INDEX_BYTES = 25 * 1024  # 25KB
+from typing import List, Tuple, Dict, Any, Optional
+from dreamer.config import MemoryConfig
 
 
 class MemoryManager:
-    def __init__(self, root_dir: Path):
+    def __init__(self, root_dir: Path, config: MemoryConfig):
         self.root_dir = Path(root_dir)
-        self.memory_file = self.root_dir / "MEMORY.md"
-        self.topics_dir = self.root_dir / "memory"
+        self.config = config
+        self.memory_file = self.root_dir / self.config.index_file
+        self.topics_dir = self.root_dir / self.config.topics_dir
 
     def ensure_structure(self):
         self.topics_dir.mkdir(parents=True, exist_ok=True)
         if not self.memory_file.exists():
             default_template = (
-                "# Project Memory Index\n\n"
-                "<!-- Top 200 lines limit: High-level invariants, rules, and topic index only. -->\n\n"
+                f"# Project Memory Index ({self.config.index_file})\n\n"
+                f"<!-- Strict limit: max {self.config.max_lines} lines / {self.config.max_bytes // 1024}KB -->\n\n"
                 "## 1. Core Invariants\n"
-                "- Build & Test commands, non-obvious runtime constraints.\n\n"
+                "- Required package managers, build flags, and non-obvious runtime constraints.\n\n"
                 "## 2. Verified Rules & Patterns\n"
-                "- Tested failure modes and their permanent fixes.\n\n"
+                "- Permanent bugfixes and anti-patterns discovered during development.\n\n"
                 "## 3. Topic Pointers\n"
-                "- Details archived in `memory/<topic>.md`.\n"
+                f"- Detailed architecture notes and ADRs are stored in `{self.config.topics_dir}/<topic>.md`.\n"
             )
             self.memory_file.write_text(default_template, encoding="utf-8")
 
@@ -34,15 +34,40 @@ class MemoryManager:
     def write_index(self, content: str):
         self.memory_file.write_text(content, encoding="utf-8")
 
-    def check_limits(self, content: str) -> Tuple[bool, int, int]:
+    def check_limits(self, content: Optional[str] = None) -> Tuple[bool, int, int]:
+        if content is None:
+            content = self.read_index()
         lines = content.splitlines()
         line_count = len(lines)
         byte_count = len(content.encode("utf-8"))
-        is_valid = line_count <= MAX_INDEX_LINES and byte_count <= MAX_INDEX_BYTES
+        is_valid = line_count <= self.config.max_lines and byte_count <= self.config.max_bytes
         return is_valid, line_count, byte_count
 
-    def archive_topic(self, topic_name: str, content: str) -> Path:
-        self.topics_dir.mkdir(parents=True, exist_ok=True)
-        topic_path = self.topics_dir / f"{topic_name}.md"
-        topic_path.write_text(content, encoding="utf-8")
-        return topic_path
+    def list_topics(self) -> List[Path]:
+        if not self.topics_dir.exists():
+            return []
+        return sorted(list(self.topics_dir.glob("*.md")))
+
+    def check_pointers(self) -> List[Dict[str, Any]]:
+        """Verify that all markdown links pointing to topics actually exist."""
+        content = self.read_index()
+        pattern = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+        matches = pattern.findall(content)
+
+        issues = []
+        for text, link in matches:
+            if link.startswith(self.config.topics_dir) or link.endswith(".md"):
+                target = (self.root_dir / link).resolve()
+                if not target.exists():
+                    issues.append({"text": text, "link": link, "status": "missing"})
+        return issues
+
+    def prune_and_truncate(self, content: str) -> str:
+        """If content exceeds max_lines, safely prune older trailing lines."""
+        lines = content.splitlines()
+        if len(lines) <= self.config.max_lines:
+            return content
+
+        truncated = lines[: self.config.max_lines - 4]
+        truncated.append("\n<!-- Auto-pruned by dreamer: exceeded max line limit. Archive details to topics. -->")
+        return "\n".join(truncated)
