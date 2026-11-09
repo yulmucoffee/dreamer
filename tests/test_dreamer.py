@@ -119,6 +119,33 @@ class TestTranscripts(Base):
             self.assertNotIn(leaked, b.text)
         self.assertLess(len(b.text) * 20, p.stat().st_size, "digest should be far smaller than the raw transcript")
 
+    def test_commit_messages_kept_without_trailers(self):
+        msg = "fix: packaging\n\nAdd explicit packages so extra top-level dirs are fine. " + "detail " * 40
+        cmd = f"git add -A && git commit -q -F - <<'EOF'\n{msg}\n\nCo-Authored-By: X <x@y>\nEOF"
+        self.transcript(self.root, "s1", [rec(self.root, "assistant", [
+            {"type": "tool_use", "id": "c", "name": "Bash", "input": {"command": cmd, "description": "Commit"}},
+            {"type": "tool_use", "id": "d", "name": "Bash", "input": {"command": "ls " + "x" * 400}}])])
+        b = transcripts.collect(self.root, self.cfg, {}, 100000)
+        self.assertIn("extra top-level dirs are fine", b.text)
+        self.assertIn("detail " * 39 + "detail", b.text)
+        self.assertNotIn("Co-Authored-By", b.text)
+        self.assertIn("…[+", b.text, "ordinary long commands are still clipped")
+
+    def test_commit_message_extraction(self):
+        cm = transcripts.commit_message
+        self.assertEqual(cm("cd x && git add a && git commit -qm init"), "init")
+        self.assertEqual(cm('git commit -m "feat: a \\"b\\""'), 'feat: a \\"b\\"')
+        self.assertEqual(cm("git -C r commit -F - <<'EOF'\nfix: y\n\nbody\nCo-Authored-By: Z\nEOF\n"), "fix: y\n\nbody")
+        self.assertEqual(cm("git log --oneline | grep commit"), "")
+        self.assertEqual(cm("git commit -m \"$(cat <<'EOF'\nfeat: z\n\nwhy\nEOF\n)\""), "feat: z\n\nwhy")
+        self.assertEqual(cm("git commit -qm init && cat > f <<'EOF'\nnot a message\nEOF"), "init")
+        # A long setup script that merely contains a short commit keeps only that message.
+        script = "mkdir t && " + "echo setup && " * 100 + "git commit -qm init && python3 - <<'PY'\n" + "x=1\n" * 200 + "PY"
+        self.transcript(self.root, "s2", [rec(self.root, "assistant", [
+            {"type": "tool_use", "id": "e", "name": "Bash", "input": {"command": script}}])])
+        b = transcripts.collect(self.root, self.cfg, {}, 100000)
+        self.assertLess(len(b.text), 400)
+
     def test_cursor_is_incremental_and_skips_partial_lines(self):
         self.transcript(self.root, "s1", self.basic_session(self.root, "FIRST"), partial='{"type": "user"')
         b1 = transcripts.collect(self.root, self.cfg, {}, 100000)

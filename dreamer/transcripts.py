@@ -25,6 +25,9 @@ ASSISTANT_CLIP = 1500
 TOOL_INPUT_CLIP = 160
 RESULT_OK_CLIP = 140
 RESULT_ERR_CLIP = 600
+# Commit messages record what changed and why, in the author's own summary:
+# the best evidence a later pass has for checking a note, so keep them.
+COMMIT_CLIP = 1500
 SEARCH_CONTEXT = 300
 SEARCH_TOTAL = 6000
 
@@ -33,6 +36,30 @@ _WRAPPERS = re.compile(
     r"user-prompt-submit-hook|persisted-output)\b[^>]*>.*?</\1>",
     re.DOTALL,
 )
+_COMMIT = r"\bgit\b[^|;&\n]*?\bcommit\b[^|;&\n]*?"
+_HEREDOC_BODY = r"<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n(.*?)\n\s*\1\b"
+# The heredoc must feed the commit itself: `-F - <<EOF` or `-m "$(cat <<EOF ...)"`.
+_COMMIT_FILE = re.compile(_COMMIT + r"\s-[a-zA-Z]*F\s*-\s[^|;&\n]*?" + _HEREDOC_BODY, re.DOTALL)
+_COMMIT_CAT = re.compile(_COMMIT + r"\s-[a-zA-Z]*m\s*\"\$\(cat\s*" + _HEREDOC_BODY, re.DOTALL)
+_COMMIT_M = re.compile(_COMMIT + r"\s-[a-zA-Z]*m\s*(\"(?:[^\"\\]|\\.)*\"|'[^']*'|[^\s'\"]+)")
+_TRAILER = re.compile(r"^\s*(Co-Authored-By|Signed-off-by|Claude-Session):.*$\n?", re.IGNORECASE | re.MULTILINE)
+
+
+def commit_message(cmd: str) -> str:
+    """The message of a `git commit` in a shell command, without trailers."""
+    m = _COMMIT_FILE.search(cmd) or _COMMIT_CAT.search(cmd)
+    if m:
+        msg = m.group(2)
+    else:
+        m = _COMMIT_M.search(cmd)
+        if not m:
+            return ""
+        msg = m.group(1)
+        if msg[:1] in "\"'":
+            msg = msg[1:-1]
+    return _TRAILER.sub("", msg).strip()
+
+
 _INPUT_KEYS = ("command", "file_path", "path", "pattern", "url", "query", "description", "skill")
 
 
@@ -90,9 +117,14 @@ def _result_text(content: Any) -> str:
 
 def _tool_summary(name: str, inp: Any) -> str:
     if isinstance(inp, dict):
+        cmd = inp.get("command")
+        msg = commit_message(cmd) if isinstance(cmd, str) else ""
         parts = [f"{k}={_oneline(str(inp[k]))}" for k in _INPUT_KEYS if k in inp][:2]
         if parts:
-            return f"{name}: " + _clip(" ".join(parts), TOOL_INPUT_CLIP)
+            out = f"{name}: " + _clip(" ".join(parts), TOOL_INPUT_CLIP)
+            if msg:
+                out += "\n    commit message: " + _clip(msg, COMMIT_CLIP).replace("\n", "\n    ")
+            return out
     return f"{name}: " + _clip(_oneline(json.dumps(inp, ensure_ascii=False)), TOOL_INPUT_CLIP)
 
 
