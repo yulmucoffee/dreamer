@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-dreamer"
-version = "0.4.0"
+version = "0.5.0"
 description = "Offline memory consolidation (dreaming) for coding agents in any harness"
 readme = "README.md"
 authors = [

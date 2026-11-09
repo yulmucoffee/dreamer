@@ -24,6 +24,29 @@ dreamer init --harness claude,codex,cursor
 
 훅 설정 파일은 모두 레포 안의 프로젝트 단위 파일입니다. 새로 만든 파일은 `.git/info/exclude`로 커밋에서 빠지고, 이미 추적 중인 파일에는 항목만 더합니다. dreamer가 없는 팀원에게 훅은 아무 일도 하지 않습니다.
 
+### 개인 메모리 (레포마다 선택)
+
+"한국어로 답하기"나 "적대적으로 검토하기" 같은 사람에 관한 기억은 프로젝트가 아니라 사람을 따라가야 합니다. `dreamer init --personal`(또는 `dreamer personal on`)을 한 레포들만 개인 저장소 `~/.dreamer/personal/`(`$DREAMER_HOME`으로 변경 가능)을 공유합니다.
+
+- **드리밍:** 같은 패스에서 `/memories/personal/`도 편집합니다.
+  - 모델에게는 "사람에 관한 것이고 어느 프로젝트에서나 참인 것만 개인 저장소에, 이 프로젝트·코드·사람·고객에 관한 것은 프로젝트에, 애매하면 프로젝트에"라고 지시합니다.
+  - 개인 저장소에는 별도의 작은 예산이 있습니다(인덱스 4KB, 전체 64KB).
+- **주입은 커밋되지 않는 로컬 파일로만:**
+
+  | 하네스 | 파일 | 비고 |
+  |---|---|---|
+  | Claude Code | `CLAUDE.local.md` 관리 블록 | |
+  | Codex | `AGENTS.override.md` | Codex는 이 파일이 있으면 `AGENTS.md` 대신 읽으므로 "AGENTS.md + 개인 블록"으로 생성하고, 동기화 때마다 다시 만듭니다. 직접 만든 override 파일이 있으면 블록만 추가합니다 |
+  | Cursor | `.cursor/rules/dreamer-personal.mdc` | `alwaysApply` 규칙 |
+
+  모두 `.git/info/exclude`로 제외하고, git이 추적 중인 파일에는 절대 쓰지 않습니다. 전역 설정(`~/.claude`, `~/.codex`, `~/.cursor`)은 건드리지 않습니다. Gemini CLI와 그 밖의 AGENTS.md 계열 도구는 프로젝트 로컬 파일이 없어 개인 메모리를 주입하지 못합니다.
+- **격리:** 켜지 않은 레포는 개인 저장소를 읽지도 쓰지도 못합니다. 그런 레포에서 패스가 `/memories/personal`에 쓰려고 하면 거부됩니다.
+- **공유 저장소 안전장치:**
+  - 적용할 때 락을 잡고, 패스 시작 후 다른 레포가 개인 저장소를 바꿨으면 중단하고 다음에 재시도합니다.
+  - `undo`는 그 뒤에 아무도 개인 저장소를 바꾸지 않았을 때만 되돌립니다.
+  - 다른 레포의 로컬 사본은 그 레포의 다음 `run`이나 훅, 또는 `dreamer sync` 때 갱신됩니다.
+- **주의:** 개인 저장소는 켠 레포 모두에 주입됩니다. 고객별로 비밀 유지가 필요한 레포들 사이에서는 켜지 않는 것이 안전합니다.
+
 ### 누가 드리밍을 하나 (엔진)
 
 자동 패스의 모델 역할은 `[dream] engine`이 정합니다. Anthropic API 키가 없어도, 이미 쓰고 있는 에이전트 구독으로 돌아갑니다.
@@ -116,7 +139,8 @@ git add memory CLAUDE.md AGENTS.md && git commit -m "chore: add project memory"
 dreamer run                 # 엔진으로 패스 실행 (임계값 무시: --force, 엔진 지정: --engine codex)
 dreamer dream start         # API 없이, 지금 쓰는 에이전트가 직접 패스 실행 (출력된 안내를 따름)
 dreamer note "pnpm만 사용; npm은 lockfile을 깨뜨림"   # 아무 하네스에서나 메모리 입력 남기기
-dreamer sync                # MEMORY.md를 손으로 고친 뒤 AGENTS.md 사본 갱신
+dreamer sync                # MEMORY.md를 손으로 고친 뒤 AGENTS.md·개인 사본 갱신
+dreamer personal on|off|show   # 이 레포에서 개인 메모리 켜기/끄기/보기
 dreamer run --batches 10    # 기존 세션 백로그를 한 번에 처리
 dreamer run --dry-run       # 적용·커서 이동 없이 미리보기
 dreamer status              # 백로그, 용량, 최근 패스와 토큰 사용량
@@ -131,6 +155,7 @@ dreamer config              # dreamer.toml 예시 출력
 - `--git-hook`: 하네스와 무관하게 커밋마다 드리밍
 - `--no-hooks`: 세션 수집과 자동 드리밍 훅 생략
 - `--with-config`: `dreamer.toml` 생성
+- `--personal`: 개인 메모리를 이 레포와 공유 (로컬 파일로만 주입)
 기존 레이아웃(루트 `MEMORY.md`)은 `dreamer init` 실행 시 `memory/MEMORY.md`로 옮겨지고 링크도 고쳐집니다.
 
 ## 설정

@@ -11,6 +11,7 @@ Failure at any point leaves the memory directory, the cursor and the inbox as
 they were, so the same material is retried on the next pass.
 """
 
+import contextlib
 import json
 import os
 import shutil
@@ -19,7 +20,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from dreamer import capture, notes, repo, store, targets, transcripts
+from dreamer import capture, notes, personal, repo, store, targets, transcripts
 from dreamer.config import DreamerConfig
 from dreamer.llm import DreamError, make_client, run_loop
 
@@ -49,7 +50,12 @@ def memory_dir(root: Path, cfg: DreamerConfig) -> Path:
 EXTERNAL_TTL = 6 * 3600  # an external pass untouched this long is treated as abandoned
 
 
-def _user_prompt(cfg: DreamerConfig, staging: Path, batch: transcripts.Batch, issues: List[str]) -> str:
+def _system(root: Path) -> str:
+    return SYSTEM_PROMPT + (personal.PROMPT if personal.enabled(root) else "")
+
+
+def _user_prompt(cfg: DreamerConfig, staging: Path, batch: transcripts.Batch, issues: List[str],
+                 pstaging: Optional[Path] = None) -> str:
     n, total = store.usage(staging)
     m = cfg.memory
     index = (staging / store.INDEX).read_text(encoding="utf-8")
@@ -60,6 +66,15 @@ def _user_prompt(cfg: DreamerConfig, staging: Path, batch: transcripts.Batch, is
         f"## Store contents\n{store.listing(staging)}",
         f"## {store.VIRTUAL_ROOT}/{store.INDEX}\n```markdown\n{index}\n```",
     ]
+    if pstaging is not None:
+        pm, (pn, ptotal) = personal.config(), store.usage(pstaging)
+        pindex = (pstaging / store.INDEX).read_text(encoding="utf-8")
+        parts += [
+            f"Personal budgets: MEMORY.md <= {pm.index_max_lines} lines and {pm.index_max_bytes} B; other files <= "
+            f"{pm.topic_max_bytes} B each; store <= {pm.store_max_bytes} B and {pm.max_files} files. Current: {pn} files, {ptotal} B.",
+            f"## Personal store contents\n{store.listing(pstaging, personal.VROOT)}",
+            f"## {personal.VROOT}/{store.INDEX}\n```markdown\n{pindex}\n```",
+        ]
     if issues:
         parts.append("## Known problems in the store\n" + "\n".join(f"- {i}" for i in issues))
     more = " More sessions remain for later passes." if batch.pending else ""
@@ -105,6 +120,30 @@ def _stage(root: Path, cfg: DreamerConfig, sdir: Path) -> Path:
     return staging
 
 
+def _stage_personal(root: Path, sdir: Path) -> Optional[str]:
+    """Stage the personal store when this repository opted in; returns its hash."""
+    pst = personal.staging(sdir)
+    shutil.rmtree(pst, ignore_errors=True)
+    if not personal.enabled(root):
+        return None
+    live = personal.ensure_store()
+    store.copy_store(live, pst)
+    return store.tree_hash(live)
+
+
+def _tools(cfg: DreamerConfig, staging: Path, sdir: Path) -> store.Mounts:
+    # /memories/personal is reserved even when personal memory is off.
+    return store.Mounts(store.MemoryTool(staging, cfg.memory), personal.tool(sdir), personal.VROOT)
+
+
+def _issues(cfg: DreamerConfig, staging: Path, sdir: Path) -> List[str]:
+    out = store.validate(staging, cfg.memory)
+    pst = personal.staging(sdir)
+    if pst.is_dir():
+        out += [f"personal: {i}" for i in store.validate(pst, personal.config())]
+    return out
+
+
 def _fail(sdir: Path, state: Dict[str, Any], err: Exception, usage: Dict[str, int], mode: str) -> None:
     state["failures"] = state.get("failures", 0) + 1
     state["runs"].append({"at": _now(), "status": "failed", "mode": mode, "error": str(err), "usage": usage})
@@ -113,20 +152,48 @@ def _fail(sdir: Path, state: Dict[str, Any], err: Exception, usage: Dict[str, in
 
 
 def _commit(root: Path, cfg: DreamerConfig, sdir: Path, state: Dict[str, Any], batch: transcripts.Batch,
-            staging: Path, before_hash: str, summary: str, usage: Dict[str, int], mode: str, started: float) -> Result:
+            staging: Path, before_hash: str, summary: str, usage: Dict[str, int], mode: str, started: float,
+            personal_before: Optional[str] = None) -> Result:
+    with contextlib.ExitStack() as stack:
+        if personal_before is not None:
+            try:  # the personal store is shared by several repositories
+                stack.enter_context(personal.lock())
+            except repo.Busy:
+                raise DreamError("personal memory is being updated by another repository's pass; will retry next time")
+        return _commit_locked(root, cfg, sdir, state, batch, staging, before_hash, summary, usage, mode, started,
+                              personal_before)
+
+
+def _commit_locked(root: Path, cfg: DreamerConfig, sdir: Path, state: Dict[str, Any], batch: transcripts.Batch,
+                   staging: Path, before_hash: str, summary: str, usage: Dict[str, int], mode: str, started: float,
+                   personal_before: Optional[str]) -> Result:
     live = memory_dir(root, cfg)
+    pst, plive = personal.staging(sdir), personal.store_dir()
     if not (staging / store.INDEX).is_file():
         raise DreamError("MEMORY.md missing after pass")
     if store.tree_hash(live) != before_hash:
         raise DreamError("memory directory was edited during the pass; will retry next time")
-    issues = store.validate(staging, cfg.memory)
+    use_personal = personal_before is not None and pst.is_dir()
+    if use_personal:
+        if not (pst / store.INDEX).is_file():
+            raise DreamError("personal MEMORY.md missing after pass")
+        if store.tree_hash(plive) != personal_before:
+            raise DreamError("personal memory was changed by another pass meanwhile; will retry next time")
+    issues = _issues(cfg, staging, sdir)
     changed: List[str] = []
-    if store.tree_hash(staging) != before_hash or not (live / store.INDEX).exists():
+    project_changed = store.tree_hash(staging) != before_hash or not (live / store.INDEX).exists()
+    personal_changed = use_personal and store.tree_hash(pst) != personal_before
+    snap = None
+    if project_changed or personal_changed:
         snap = store.snapshot(live, sdir / "snapshots", json.dumps(state), cfg.dream.snapshots)
-        changed = store.apply_store(staging, live)
-    else:
-        snap = None
+        if project_changed:
+            changed = store.apply_store(staging, live)
+        if personal_changed:
+            store.copy_store(plive, snap / "personal")
+            changed += [f"personal/{c}" for c in store.apply_store(pst, plive)]
+            (snap / "personal.json").write_text(json.dumps({"after": store.tree_hash(plive)}), encoding="utf-8")
     shutil.rmtree(staging, ignore_errors=True)
+    shutil.rmtree(pst, ignore_errors=True)
     if batch.notes:  # keep consumed notes with the snapshot so `undo` can put them back
         if snap is None:
             snap = store.snapshot(live, sdir / "snapshots", json.dumps(state), cfg.dream.snapshots)
@@ -178,7 +245,9 @@ def run(
 
         before_hash = store.tree_hash(memory_dir(root, cfg))
         staging = _stage(root, cfg, sdir)
-        tool = store.MemoryTool(staging, cfg.memory)
+        personal_before = _stage_personal(root, sdir)
+        tool = _tools(cfg, staging, sdir)
+        system = _system(root)
         handlers = {
             "memory": tool.execute,
             "search_transcripts": lambda inp: transcripts.search(root, cfg, inp.get("pattern", ""), inp.get("max_results", 8)),
@@ -187,18 +256,22 @@ def run(
         started = time.time()
         try:
             client = client_factory()
-            messages = [{"role": "user", "content": _user_prompt(cfg, staging, batch, store.validate(staging, cfg.memory))}]
-            summary, used = run_loop(client, cfg.model, SYSTEM_PROMPT, messages, handlers, cfg.model.max_turns, usage)
-            issues = store.validate(staging, cfg.memory)
+            prompt = _user_prompt(cfg, staging, batch, _issues(cfg, staging, sdir),
+                                  personal.staging(sdir) if personal_before is not None else None)
+            messages = [{"role": "user", "content": prompt}]
+            summary, used = run_loop(client, cfg.model, system, messages, handlers, cfg.model.max_turns, usage)
+            issues = _issues(cfg, staging, sdir)
             if issues and tool.changed and used < cfg.model.max_turns:
                 messages.append({"role": "user", "content": "The store now has these problems; fix them, then end:\n"
                                  + "\n".join(f"- {i}" for i in issues)})
-                summary, _ = run_loop(client, cfg.model, SYSTEM_PROMPT, messages, handlers, cfg.model.max_turns - used, usage)
+                summary, _ = run_loop(client, cfg.model, system, messages, handlers, cfg.model.max_turns - used, usage)
             if dry_run:
                 preview = (staging / store.INDEX).read_text(encoding="utf-8")
                 shutil.rmtree(staging, ignore_errors=True)
+                shutil.rmtree(personal.staging(sdir), ignore_errors=True)
                 return Result("dry-run", f"{summary}\n\n--- {store.INDEX} preview ---\n{preview}", usage=usage)
-            return _commit(root, cfg, sdir, state, batch, staging, before_hash, summary, usage, "api", started)
+            return _commit(root, cfg, sdir, state, batch, staging, before_hash, summary, usage, "api", started,
+                           personal_before)
         except DreamError as e:
             if not dry_run:
                 _fail(sdir, state, e, usage, "api")
@@ -243,13 +316,15 @@ def external_start(root: Path, cfg: DreamerConfig, *, force: bool = False, resta
         if gated:
             return gated
         staging = _stage(root, cfg, sdir)
+        personal_before = _stage_personal(root, sdir)
         before_hash = store.tree_hash(memory_dir(root, cfg))
-        prompt = _user_prompt(cfg, staging, batch, store.validate(staging, cfg.memory))
+        prompt = _user_prompt(cfg, staging, batch, _issues(cfg, staging, sdir),
+                              personal.staging(sdir) if personal_before is not None else None)
         repo.atomic_write(_ext_path(sdir), json.dumps({
-            "started": time.time(), "before_hash": before_hash, "cursors": batch.cursors, "notes": batch.notes,
+            "started": time.time(), "before_hash": before_hash, "personal_before": personal_before, "cursors": batch.cursors, "notes": batch.notes,
             "sessions": batch.sessions, "text_chars": len(batch.text),
         }))
-        text = (EXTERNAL_GUIDE.format(dir=cfg.memory.dir) + "\n=== SYSTEM PROMPT ===\n" + SYSTEM_PROMPT
+        text = (EXTERNAL_GUIDE.format(dir=cfg.memory.dir) + "\n=== SYSTEM PROMPT ===\n" + _system(root)
                 + "\n\n=== USER MESSAGE ===\n" + prompt + "\n")
         return Result("started", text)
 
@@ -264,7 +339,7 @@ def _ext_load(sdir: Path) -> Dict[str, Any]:
 def external_memory(root: Path, cfg: DreamerConfig, command: Dict[str, Any]) -> str:
     sdir = repo.state_dir(root)
     _ext_load(sdir)
-    return store.MemoryTool(sdir / "staging", cfg.memory).execute(command)
+    return _tools(cfg, sdir / "staging", sdir).execute(command)
 
 
 def external_search(root: Path, cfg: DreamerConfig, pattern: str, max_results: int = 8) -> str:
@@ -277,7 +352,7 @@ def external_finish(root: Path, cfg: DreamerConfig, summary: str = "", accept: b
     with repo.lock(sdir):
         ext = _ext_load(sdir)
         staging = sdir / "staging"
-        issues = store.validate(staging, cfg.memory)
+        issues = _issues(cfg, staging, sdir)
         if issues and not accept:
             return Result("needs-fix", "Fix these problems, then run `dreamer dream finish` again "
                           "(or `--accept` to apply anyway):\n" + "\n".join(f"- {i}" for i in issues))
@@ -285,7 +360,8 @@ def external_finish(root: Path, cfg: DreamerConfig, summary: str = "", accept: b
         batch = transcripts.Batch(text="x" * ext["text_chars"], cursors=ext["cursors"],
                                   sessions=ext["sessions"], notes=ext["notes"])
         try:
-            res = _commit(root, cfg, sdir, state, batch, staging, ext["before_hash"], summary, {}, "agent", ext["started"])
+            res = _commit(root, cfg, sdir, state, batch, staging, ext["before_hash"], summary, {}, "agent", ext["started"],
+                          ext.get("personal_before"))
         except DreamError as e:
             _fail(sdir, state, e, {}, "agent")
             _ext_path(sdir).unlink(missing_ok=True)
@@ -300,6 +376,7 @@ def external_abort(root: Path) -> bool:
         existed = _ext_path(sdir).exists()
         _ext_path(sdir).unlink(missing_ok=True)
         shutil.rmtree(sdir / "staging", ignore_errors=True)
+        shutil.rmtree(personal.staging(sdir), ignore_errors=True)
         return existed
 
 
@@ -318,7 +395,8 @@ def _now() -> str:
 
 def undo(root: Path, cfg: DreamerConfig) -> Optional[str]:
     """Restore memory, cursor and consumed notes from the latest snapshot, so
-    the undone material is dreamed again on the next pass."""
+    the undone material is dreamed again on the next pass. The shared personal
+    store is restored only if no other repository changed it since."""
     sdir = repo.state_dir(root)
     with repo.lock(sdir):
         snaps = sorted(p for p in (sdir / "snapshots").glob("*") if p.is_dir()) if (sdir / "snapshots").exists() else []
@@ -330,6 +408,16 @@ def undo(root: Path, cfg: DreamerConfig) -> Optional[str]:
             state = json.loads((snap / "state.json").read_text(encoding="utf-8"))
             state["failures"] = 0
             repo.save_state(sdir, state)
+        if (snap / "personal").is_dir():
+            try:
+                with personal.lock():
+                    after = json.loads((snap / "personal.json").read_text(encoding="utf-8")).get("after")
+                    if store.tree_hash(personal.store_dir()) == after:
+                        store.apply_store(snap / "personal", personal.store_dir())
+                    else:
+                        repo.log(sdir, "undo: personal memory changed since this pass; left as is")
+            except (repo.Busy, OSError, ValueError):
+                repo.log(sdir, "undo: personal memory busy or unreadable; left as is")
         if (snap / "inbox").is_dir():
             notes.inbox(root).mkdir(parents=True, exist_ok=True)
             for f in (snap / "inbox").iterdir():

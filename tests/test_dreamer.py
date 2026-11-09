@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest import mock
 
-from dreamer import dream, install, notes, repo, store, targets, transcripts
+from dreamer import dream, install, notes, personal, repo, store, targets, transcripts
 from dreamer.config import DreamerConfig
 from dreamer.llm import DreamError
 
@@ -741,6 +741,150 @@ class TestEngines(Base):
         self.assertIn("Bash(dreamer dream:*)", engines.command(self.cfg, "claude-code", False))
         with mock.patch.dict(os.environ, {"DREAMER_DREAMING": "1"}):
             self.assertEqual(engines.run(self.root, self.cfg).status, "skipped")
+
+
+class TestPersonal(Base):
+    """Opt-in personal memory shared by one person's repositories."""
+
+    def setUp(self):
+        super().setUp()
+        self.dhome = self.tmp / "dreamer-home"
+        self.env3 = mock.patch.dict(os.environ, {"DREAMER_HOME": str(self.dhome)})
+        self.env3.start()
+        self.repo_b = self.tmp / "work" / "repo-b"
+        self.repo_c = self.tmp / "work" / "repo-c"
+        for r in (self.repo_b, self.repo_c):
+            r.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=r, check=True)
+        install.init(self.root, self.cfg, harnesses=["claude", "codex", "cursor"])
+        install.init(self.repo_b, DreamerConfig(), harnesses=["claude", "codex", "cursor"])
+        install.init(self.repo_c, DreamerConfig(), harnesses=["claude", "codex", "cursor"])
+        personal.enable(self.root, ["claude", "codex", "cursor"])
+        personal.enable(self.repo_b, ["claude", "codex", "cursor"])
+
+    def tearDown(self):
+        self.env3.stop()
+        super().tearDown()
+
+    def personal_script(self, line="- Answer in Korean; review adversarially (2026-11-08, s:sess-aaa)"):
+        return [
+            resp(tool("memory", {"command": "str_replace", "path": "/memories/personal/MEMORY.md", "old_str": "# Personal memory\n",
+                                 "new_str": f"# Personal memory\n{line}\n"}, 1),
+                 tool("memory", {"command": "str_replace", "path": "/memories/MEMORY.md", "old_str": "# Project memory\n",
+                                 "new_str": "# Project memory\n- pnpm only\n"}, 2), stop="tool_use"),
+            resp(text("Recorded a personal preference and a project rule.")),
+        ]
+
+    def test_injected_only_through_local_uncommitted_files(self):
+        local = {"CLAUDE.local.md", "AGENTS.override.md", ".cursor/rules/dreamer-personal.mdc"}
+        exclude = (self.root / ".git" / "info" / "exclude").read_text().splitlines()
+        for rel in local:
+            self.assertTrue((self.root / rel).exists(), rel)
+            self.assertIn(rel, exclude)
+        override = (self.root / "AGENTS.override.md").read_text()
+        self.assertTrue(override.startswith(personal.OVERRIDE_HEADER))
+        self.assertIn("## Project memory", override, "Codex reads the override instead of AGENTS.md, so it embeds it")
+        self.assertIn("## Personal memory", override)
+        for shared in ("CLAUDE.md", "AGENTS.md"):
+            self.assertNotIn("Personal memory", (self.root / shared).read_text())
+        for rel in local:
+            self.assertFalse((self.repo_c / rel).exists(), "a repository that did not opt in gets nothing")
+
+    def test_tracked_files_are_never_written(self):
+        repo_d = self.tmp / "work" / "repo-d"
+        repo_d.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo_d, check=True)
+        (repo_d / "CLAUDE.local.md").write_text("# committed by the team\n")
+        subprocess.run(["git", "add", "CLAUDE.local.md"], cwd=repo_d, check=True)
+        install.init(repo_d, DreamerConfig(), harnesses=["claude"])
+        out = personal.enable(repo_d, ["claude"])
+        self.assertTrue(any("tracked by git" in o for o in out))
+        self.assertEqual((repo_d / "CLAUDE.local.md").read_text(), "# committed by the team\n")
+
+    def test_learned_in_one_repo_reaches_the_others_that_opted_in(self):
+        self.transcript(self.root, "s1", self.basic_session(self.root, "MINE"))
+        res, client = self.run_pass(self.personal_script())
+        self.assertEqual(res.status, "applied")
+        self.assertIn("personal/MEMORY.md", res.changed)
+        req = client.requests[0]
+        self.assertIn("/memories/personal/", req["system"])
+        self.assertIn("## /memories/personal/MEMORY.md", req["messages"][0]["content"])
+        self.assertIn("Answer in Korean", (self.dhome / "personal" / "MEMORY.md").read_text())
+        self.assertIn("pnpm only", (self.root / "memory" / "MEMORY.md").read_text())
+        self.assertNotIn("Korean", (self.root / "memory" / "MEMORY.md").read_text())
+        self.assertIn("Answer in Korean", (self.root / "CLAUDE.local.md").read_text())
+        # Repo B picks it up on its next sync (every run / hook does one); repo C never.
+        self.assertIn("CLAUDE.local.md", targets.stale(self.repo_b, DreamerConfig()))
+        targets.sync(self.repo_b, DreamerConfig())
+        for rel in ("CLAUDE.local.md", "AGENTS.override.md", ".cursor/rules/dreamer-personal.mdc"):
+            self.assertIn("Answer in Korean", (self.repo_b / rel).read_text())
+        targets.sync(self.repo_c, DreamerConfig())
+        self.assertNotIn("Korean", "".join(p.read_text() for p in self.repo_c.rglob("*.md")))
+        self.assertNotIn("pnpm only", (self.repo_b / "memory" / "MEMORY.md").read_text(), "project memory stays per repo")
+
+    def test_disabled_repo_cannot_touch_personal_memory(self):
+        repo_c_cfg = DreamerConfig()
+        repo_c_cfg.dream.min_new_chars = 50
+        self.transcript(self.repo_c, "s1", self.basic_session(self.repo_c, "C"))
+        client = FakeClient([
+            resp(tool("memory", {"command": "create", "path": "/memories/personal/x.md", "file_text": "x"}, 1), stop="tool_use"),
+            resp(text("nothing"))])
+        res = dream.run(self.repo_c, repo_c_cfg, client_factory=lambda: client)
+        self.assertEqual(res.status, "unchanged")
+        err = client.requests[1]["messages"][-1]["content"][0]
+        self.assertTrue(err["is_error"])
+        self.assertIn("not enabled", err["content"])
+        self.assertFalse((self.repo_c / "memory" / "personal").exists())
+        self.assertNotIn("/memories/personal", client.requests[0]["system"])
+
+    def test_concurrent_change_from_another_repo_aborts(self):
+        self.transcript(self.root, "s1", self.basic_session(self.root, "MINE"))
+        pidx = self.dhome / "personal" / "MEMORY.md"
+
+        def other_repo_writes(n):
+            if n == 2:
+                pidx.write_text("# Personal memory\n- written by repo B meanwhile\n")
+        with self.assertRaises(DreamError):
+            self.run_pass(self.personal_script(), on_call=other_repo_writes)
+        self.assertIn("repo B meanwhile", pidx.read_text())
+        self.assertNotIn("pnpm only", (self.root / "memory" / "MEMORY.md").read_text())
+        self.assertEqual(self.state()["files"], {})
+
+    def test_undo_restores_personal_only_if_untouched_since(self):
+        self.transcript(self.root, "s1", self.basic_session(self.root, "MINE"))
+        pidx = self.dhome / "personal" / "MEMORY.md"
+        self.run_pass(self.personal_script())
+        dream.undo(self.root, self.cfg)
+        self.assertEqual(pidx.read_text(), "# Personal memory\n")
+        self.assertNotIn("pnpm only", (self.root / "memory" / "MEMORY.md").read_text())
+
+        self.run_pass(self.personal_script())
+        pidx.write_text(pidx.read_text() + "- added later from repo B\n")
+        dream.undo(self.root, self.cfg)
+        self.assertIn("added later from repo B", pidx.read_text(), "another repo's later change is not rolled back")
+        self.assertNotIn("pnpm only", (self.root / "memory" / "MEMORY.md").read_text(), "project memory still undone")
+
+    def test_budget_and_own_override_file(self):
+        t = personal.tool(self.tmp / "nostage")
+        self.assertIsNone(t)
+        tool_ = store.MemoryTool(personal.ensure_store(), personal.config(), personal.VROOT)
+        with self.assertRaises(store.ToolError):
+            tool_.execute({"command": "create", "path": "/memories/personal/MEMORY.md", "file_text": "x" * 5000})
+        mine = self.repo_c / "AGENTS.override.md"
+        mine.write_text("# My own Codex overrides\nUse the staging cluster.\n")
+        personal.enable(self.repo_c, ["codex"])
+        text = mine.read_text()
+        self.assertTrue(text.startswith("# My own Codex overrides\nUse the staging cluster."))
+        self.assertIn("## Personal memory", text)
+        personal.disable(self.repo_c)
+        self.assertEqual(mine.read_text(), "# My own Codex overrides\nUse the staging cluster.\n")
+
+    def test_disable_and_uninstall_remove_local_copies(self):
+        personal.disable(self.root)
+        for rel in ("CLAUDE.local.md", "AGENTS.override.md", ".cursor/rules/dreamer-personal.mdc"):
+            self.assertFalse((self.root / rel).exists(), rel)
+        self.assertFalse(personal.enabled(self.root))
+        self.assertTrue((self.dhome / "personal" / "MEMORY.md").exists(), "the store itself is kept")
 
 
 class TestConfig(unittest.TestCase):

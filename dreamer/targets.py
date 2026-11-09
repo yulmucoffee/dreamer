@@ -93,12 +93,16 @@ def installed(root: Path) -> List[str]:
 
 
 def sync(root: Path, cfg: DreamerConfig) -> List[str]:
-    """Refresh every installed block (the AGENTS.md copy follows MEMORY.md)."""
-    return [FILES[k] for k in installed(root) if upsert(root / FILES[k], block(k, root, cfg))]
+    """Refresh every installed block (the AGENTS.md copy follows MEMORY.md),
+    then the local personal-memory copies (which embed AGENTS.md for Codex)."""
+    from dreamer import personal
+    out = [FILES[k] for k in installed(root) if upsert(root / FILES[k], block(k, root, cfg))]
+    return out + personal.sync(root)
 
 
 def stale(root: Path, cfg: DreamerConfig) -> List[str]:
-    out = []
+    from dreamer import personal
+    out = personal.stale(root)
     for k in installed(root):
         m = _BLOCK.search((root / FILES[k]).read_text(encoding="utf-8"))
         if m and m.group(0) != block(k, root, cfg):

@@ -44,12 +44,12 @@ def usage(root: Path) -> Tuple[int, int]:
     return len(files), sum(p.stat().st_size for p in files)
 
 
-def listing(root: Path) -> str:
+def listing(root: Path, vroot: str = VIRTUAL_ROOT) -> str:
     rows = []
     for p in iter_files(root):
         rel = p.relative_to(root).as_posix()
         first = next((l.strip() for l in p.read_text(encoding="utf-8", errors="replace").splitlines() if l.strip()), "")
-        rows.append(f"- {VIRTUAL_ROOT}/{rel} ({p.stat().st_size} B) {first[:80]}")
+        rows.append(f"- {vroot}/{rel} ({p.stat().st_size} B) {first[:80]}")
     return "\n".join(rows) or "(empty)"
 
 
@@ -92,18 +92,19 @@ def validate(root: Path, cfg: MemoryConfig) -> List[str]:
 
 
 class MemoryTool:
-    """Backend for the memory tool, confined to one directory."""
+    """Backend for the memory tool, confined to one directory mounted at `vroot`."""
 
-    def __init__(self, root: Path, cfg: MemoryConfig):
+    def __init__(self, root: Path, cfg: MemoryConfig, vroot: str = VIRTUAL_ROOT):
         self.root = root.resolve()
         self.cfg = cfg
+        self.vroot = vroot
         self.changed = False
 
     # -- path safety -----------------------------------------------------
     def _resolve(self, vpath: str) -> Path:
-        if not isinstance(vpath, str) or not (vpath == VIRTUAL_ROOT or vpath.startswith(VIRTUAL_ROOT + "/")):
-            raise ToolError(f"path must be under {VIRTUAL_ROOT}")
-        rel = vpath[len(VIRTUAL_ROOT) :].strip("/")
+        if not isinstance(vpath, str) or not (vpath == self.vroot or vpath.startswith(self.vroot + "/")):
+            raise ToolError(f"path must be under {self.vroot}")
+        rel = vpath[len(self.vroot) :].strip("/")
         parts = [p for p in rel.split("/") if p]
         if any(p in (".", "..") or p.startswith(".") for p in parts):
             raise ToolError("invalid path component")
@@ -153,7 +154,7 @@ class MemoryTool:
 
     def _read(self, p: Path) -> str:
         if not p.is_file():
-            raise ToolError(f"{VIRTUAL_ROOT}/{self._rel(p)} does not exist")
+            raise ToolError(f"{self.vroot}/{self._rel(p)} does not exist")
         return p.read_text(encoding="utf-8")
 
     # -- commands --------------------------------------------------------
@@ -170,7 +171,7 @@ class MemoryTool:
             n, total = usage(self.root)
             return (
                 f"Store usage: {n}/{self.cfg.max_files} files, {total}/{self.cfg.store_max_bytes} B\n"
-                + listing(self.root)
+                + listing(self.root, self.vroot)
             )
         lines = self._read(p).splitlines()
         start, end = 1, len(lines)
@@ -241,6 +242,38 @@ class MemoryTool:
         os.replace(src, dst)
         self.changed = True
         return f"Renamed {inp.get('old_path')} to {inp.get('new_path')}"
+
+
+class Mounts:
+    """The memory tool over the project store (/memories) and, when the person
+    opted in, their personal store (/memories/personal). Each keeps its own
+    budgets; nothing moves between them implicitly."""
+
+    def __init__(self, project: MemoryTool, personal: Optional[MemoryTool] = None, personal_vroot: str = ""):
+        self.project, self.personal, self.pv = project, personal, personal_vroot
+
+    @property
+    def changed(self) -> bool:
+        return self.project.changed or bool(self.personal and self.personal.changed)
+
+    def _is_personal(self, p) -> bool:
+        return bool(self.pv) and isinstance(p, str) and (p.rstrip("/") == self.pv or p.startswith(self.pv + "/"))
+
+    def execute(self, inp: Dict) -> str:
+        paths = [inp.get(k) for k in ("path", "old_path", "new_path") if isinstance(inp.get(k), str)]
+        sides = {self._is_personal(p) for p in paths}
+        if len(sides) > 1:
+            raise ToolError("cannot rename between project and personal memory; create the page in the other store, then delete this one")
+        if True in sides:
+            if self.personal is None:
+                raise ToolError("personal memory is not enabled for this repository")
+            return self.personal.execute(inp)
+        out = self.project.execute(inp)
+        if inp.get("command") == "view" and (inp.get("path") or VIRTUAL_ROOT).rstrip("/") == VIRTUAL_ROOT and self.personal:
+            n, total = usage(self.personal.root)
+            out += (f"\n\nPersonal store ({self.pv}): {n}/{self.personal.cfg.max_files} files, "
+                    f"{total}/{self.personal.cfg.store_max_bytes} B\n" + listing(self.personal.root, self.pv))
+        return out
 
 
 # -- staging, apply, snapshots -------------------------------------------------

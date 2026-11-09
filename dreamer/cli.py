@@ -5,7 +5,7 @@ from pathlib import Path
 
 import json
 
-from dreamer import capture, dream, engines, install, notes, repo, store, targets, transcripts
+from dreamer import capture, dream, engines, install, notes, personal, repo, store, targets, transcripts
 from dreamer.config import EXAMPLE_TOML, DreamerConfig
 from dreamer.llm import DreamError
 
@@ -32,6 +32,12 @@ def main(argv=None):
     p.add_argument("--no-hooks", action="store_true", help="don't add harness hooks (session capture / auto dreaming)")
     p.add_argument("--git-hook", action="store_true", help="also dream after each commit (harness-independent)")
     p.add_argument("--with-config", action="store_true", help="write a dreamer.toml with the defaults")
+    p.add_argument("--personal", action="store_true", help="also share your personal memory (~/.dreamer/personal) "
+                   "with this repository, through local uncommitted files only")
+
+    p = add("personal", "turn personal memory on or off for this repository, or show it")
+    p.add_argument("action", choices=["on", "off", "show"])
+    p.add_argument("--harness", default="", help="on: comma list (default: the ones dreamer init set up)")
 
     p = add("capture", "record a harness hook event from stdin (used by installed hooks)")
     p.add_argument("source", choices=["cursor", "generic"])
@@ -84,8 +90,30 @@ def main(argv=None):
         for line in install.init(root, cfg, harnesses=harnesses, git_hook=args.git_hook,
                                  hooks=not args.no_hooks, with_config=args.with_config):
             print(f"[dreamer] {line}")
+        if args.personal:
+            for line in personal.enable(root, harnesses or install.detect_harnesses(root)):
+                print(f"[dreamer] {line}")
         files = " ".join([f"{cfg.memory.dir}/"] + [targets.FILES[k] for k in targets.installed(root)])
-        print(f"[dreamer] Ready. Commit {files} to share the memory.")
+        print(f"[dreamer] Ready. Commit {files} to share the project memory.")
+        return 0
+
+    if args.command == "personal":
+        if args.action == "on":
+            kinds = [h.strip() for h in args.harness.split(",") if h.strip()] or install.detect_harnesses(root)
+            lines = personal.enable(root, kinds)
+        elif args.action == "off":
+            lines = personal.disable(root)
+        else:
+            d = personal.store_dir()
+            n, total = store.usage(d)
+            lines = [f"{'enabled' if personal.enabled(root) else 'not enabled'} for this repository "
+                     f"(harnesses: {', '.join(personal.harnesses(root)) or '-'})",
+                     f"store {d}: {n} files, {total} B"]
+            idx = d / store.INDEX
+            if idx.exists():
+                lines.append(idx.read_text(encoding="utf-8").rstrip())
+        for line in lines:
+            print(f"[dreamer] {line}" if not line.startswith("#") and "\n" not in line else line)
         return 0
 
     if args.command == "capture":
@@ -114,6 +142,9 @@ def main(argv=None):
         return _dream(args, root, cfg)
 
     if args.command == "uninstall":
+        if personal.enabled(root):
+            for line in personal.disable(root):
+                print(f"[dreamer] {line}")
         for line in install.uninstall(root):
             print(f"[dreamer] {line}")
         return 0
@@ -131,6 +162,13 @@ def main(argv=None):
             print(f"[dreamer] {store.INDEX}: {len(t.splitlines())}/{cfg.memory.index_max_lines} lines, "
                   f"{len(t.encode())}/{cfg.memory.index_max_bytes} B (injected every session)")
         print(f"[dreamer] store: {n}/{cfg.memory.max_files} files, {total}/{cfg.memory.store_max_bytes} B")
+        if personal.enabled(root):
+            pd = personal.store_dir()
+            pn, ptotal = store.usage(pd)
+            pc = personal.config()
+            print(f"[dreamer] personal store ({pd}): {pn}/{pc.max_files} files, {ptotal}/{pc.store_max_bytes} B")
+            if pd.is_dir():
+                issues = issues + [f"personal: {i}" for i in store.validate(pd, pc)]
         stale = targets.stale(root, cfg)
         if stale:
             issues = issues + [f"injected copy out of date in {', '.join(stale)} (run `dreamer sync`)"]
