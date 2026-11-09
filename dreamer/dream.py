@@ -51,6 +51,8 @@ EXTERNAL_TTL = 6 * 3600  # an external pass untouched this long is treated as ab
 
 
 def _system(root: Path) -> str:
+    if personal.is_root(root):
+        return personal.PERSONAL_SYSTEM
     return SYSTEM_PROMPT + (personal.PROMPT if personal.enabled(root) else "")
 
 
@@ -155,7 +157,7 @@ def _commit(root: Path, cfg: DreamerConfig, sdir: Path, state: Dict[str, Any], b
             staging: Path, before_hash: str, summary: str, usage: Dict[str, int], mode: str, started: float,
             personal_before: Optional[str] = None) -> Result:
     with contextlib.ExitStack() as stack:
-        if personal_before is not None:
+        if personal_before is not None or personal.is_root(root):
             try:  # the personal store is shared by several repositories
                 stack.enter_context(personal.lock())
             except repo.Busy:
@@ -324,7 +326,10 @@ def external_start(root: Path, cfg: DreamerConfig, *, force: bool = False, resta
             "started": time.time(), "before_hash": before_hash, "personal_before": personal_before, "cursors": batch.cursors, "notes": batch.notes,
             "sessions": batch.sessions, "text_chars": len(batch.text),
         }))
-        text = (EXTERNAL_GUIDE.format(dir=cfg.memory.dir) + "\n=== SYSTEM PROMPT ===\n" + _system(root)
+        guide = EXTERNAL_GUIDE.format(dir=cfg.memory.dir)
+        if personal.is_root(root):  # every follow-up command must target the personal store too
+            guide = guide.replace("dreamer dream ", "dreamer dream --personal ")
+        text = (guide + "\n=== SYSTEM PROMPT ===\n" + _system(root)
                 + "\n\n=== USER MESSAGE ===\n" + prompt + "\n")
         return Result("started", text)
 

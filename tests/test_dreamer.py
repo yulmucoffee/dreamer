@@ -887,6 +887,96 @@ class TestPersonal(Base):
         self.assertTrue((self.dhome / "personal" / "MEMORY.md").exists(), "the store itself is kept")
 
 
+class TestMcpAndPersonalPass(TestPersonal):
+    """Chat apps and other MCP clients share the same memory."""
+
+    def mcp(self, repo_dir, *calls):
+        msgs = [{"jsonrpc": "2.0", "id": 0, "method": "initialize",
+                 "params": {"protocolVersion": "2025-06-18", "clientInfo": {"name": "Claude Desktop"}, "capabilities": {}}},
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}]
+        msgs += [{"jsonrpc": "2.0", "id": 10 + i, "method": "tools/call", "params": {"name": n, "arguments": a}}
+                 for i, (n, a) in enumerate(calls)]
+        args = [sys.executable, "-m", "dreamer.cli", "mcp"] + (["--repo-dir", str(repo_dir)] if repo_dir else [])
+        r = subprocess.run(args, input="\n".join(json.dumps(m) for m in msgs) + "\n", text=True, capture_output=True,
+                           cwd=self.tmp, env={**os.environ, "DREAMER_HOME": str(self.dhome)}, timeout=60)
+        out = [json.loads(l) for l in r.stdout.splitlines()]
+        self.assertEqual(out[0]["result"]["protocolVersion"], "2025-06-18")
+        self.assertIn("memory_note", [t["name"] for t in out[1]["result"]["tools"]])
+        return [o["result"] for o in out[2:]]
+
+    def text(self, result):
+        return result["content"][0]["text"]
+
+    def test_repo_scope_serves_project_and_opted_in_personal(self):
+        (self.root / "memory" / "MEMORY.md").write_text("# Project memory\n- [build](build.md): pnpm only\n")
+        (self.root / "memory" / "build.md").write_text("# Build\n- pnpm, never npm\n")
+        (self.dhome / "personal" / "MEMORY.md").write_text("# Personal memory\n- Answer in Korean\n")
+        recall, page, ppage, found, bad, saved = self.mcp(
+            self.root, ("memory_recall", {}), ("memory_read", {"page": "build.md"}),
+            ("memory_read", {"page": "personal/MEMORY.md"}), ("memory_search", {"query": "pnpm"}),
+            ("memory_read", {"page": "../../etc/passwd"}),
+            ("memory_note", {"text": "Release tags are signed", "about": "project"}))
+        self.assertIn("pnpm only", self.text(recall))
+        self.assertIn("Answer in Korean", self.text(recall))
+        self.assertIn("never npm", self.text(page))
+        self.assertIn("Answer in Korean", self.text(ppage))
+        self.assertIn("build.md:2:", self.text(found))
+        self.assertTrue(bad["isError"])
+        self.assertFalse(saved["isError"])
+        [n] = notes.pending(self.root)
+        self.assertIn("Release tags are signed", n.read_text())
+        self.assertIn("ClaudeDesktop", n.read_text(), "the note says which client wrote it")
+
+    def test_repo_without_personal_opt_in_never_exposes_it(self):
+        (self.dhome / "personal" / "MEMORY.md").write_text("# Personal memory\n- SECRET-PREF\n")
+        recall, ppage, pnote = self.mcp(self.repo_c, ("memory_recall", {}), ("memory_read", {"page": "personal/MEMORY.md"}),
+                                        ("memory_note", {"text": "x", "about": "me"}))
+        self.assertNotIn("SECRET-PREF", self.text(recall))
+        self.assertTrue(ppage["isError"])
+        self.assertTrue(pnote["isError"])
+
+    def test_chat_app_scope_is_personal_only_and_notes_get_dreamed(self):
+        (self.dhome / "personal" / "MEMORY.md").write_text("# Personal memory\n")
+        recall, proj, saved = self.mcp(None, ("memory_recall", {}), ("memory_read", {"page": "build.md"}),
+                                       ("memory_note", {"text": "Prefers tables over long prose in answers", "about": "me"}))
+        self.assertNotIn("Project memory", self.text(recall))
+        self.assertTrue(proj["isError"])
+        self.assertFalse(saved["isError"])
+        home = personal.home()
+        self.assertEqual(len(notes.pending(home)), 1)
+
+        # A personal-only pass consolidates it into the personal store.
+        pcfg = personal.adapt(home, DreamerConfig())
+        self.assertEqual(pcfg.memory.index_max_bytes, 4096)
+        client = FakeClient([
+            resp(tool("memory", {"command": "str_replace", "path": "/memories/MEMORY.md", "old_str": "# Personal memory\n",
+                                 "new_str": "# Personal memory\n- Prefers tables over long prose (2026-11-09, note)\n"}, 1),
+                 stop="tool_use"),
+            resp(text("Recorded answer-format preference."))])
+        res = dream.run(home, pcfg, force=True, client_factory=lambda: client)
+        self.assertEqual(res.status, "applied")
+        self.assertIn("one person's own long-term memory", client.requests[0]["system"])
+        self.assertIn("Notes recorded by agents", client.requests[0]["messages"][0]["content"])
+        self.assertIn("Prefers tables", (self.dhome / "personal" / "MEMORY.md").read_text())
+        self.assertEqual(notes.pending(home), [])
+        # Opted-in repositories see it on their next sync; others never.
+        targets.sync(self.root, self.cfg)
+        self.assertIn("Prefers tables", (self.root / "CLAUDE.local.md").read_text())
+        self.assertFalse((self.repo_c / "CLAUDE.local.md").exists())
+
+    def test_personal_pass_guide_targets_the_personal_store(self):
+        home = personal.home()
+        notes.add(home, "Uses vim keybindings everywhere " + "x" * 300, "chat")
+        res = dream.external_start(home, personal.adapt(home, DreamerConfig()), force=True)
+        self.assertEqual(res.status, "started")
+        self.assertIn("dreamer dream --personal memory", res.message)
+        self.assertNotIn("dreamer dream memory", res.message)
+        from dreamer import engines
+        self.assertIn("dreamer dream --personal start", " ".join(engines.command(self.cfg, "claude-code", False, True)))
+        dream.external_abort(home)
+
+
 class TestConfig(unittest.TestCase):
     def test_unknown_and_wrongly_typed_keys_warn(self):
         with tempfile.TemporaryDirectory() as d:

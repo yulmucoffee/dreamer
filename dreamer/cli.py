@@ -5,7 +5,7 @@ from pathlib import Path
 
 import json
 
-from dreamer import capture, dream, engines, install, notes, personal, repo, store, targets, transcripts
+from dreamer import capture, dream, engines, install, mcp, notes, personal, repo, store, targets, transcripts
 from dreamer.config import EXAMPLE_TOML, DreamerConfig
 from dreamer.llm import DreamError
 
@@ -39,14 +39,19 @@ def main(argv=None):
     p.add_argument("action", choices=["on", "off", "show"])
     p.add_argument("--harness", default="", help="on: comma list (default: the ones dreamer init set up)")
 
+    p = add("mcp", "serve memory over MCP (stdio) for chat apps and other MCP clients")
+    p.add_argument("--print-config", action="store_true", help="print the client config snippet and exit")
+
     p = add("capture", "record a harness hook event from stdin (used by installed hooks)")
     p.add_argument("source", choices=["cursor", "generic"])
 
     p = add("note", "record an observation for the next dreaming pass (any harness)")
+    p.add_argument("--personal", dest="personal_scope", action="store_true", help="act on your personal memory itself (notes from chat apps), not a project")
     p.add_argument("text", nargs="?", help="note text (default: read stdin)")
     p.add_argument("--source", default="", help="who wrote it, e.g. codex, cursor, gemini")
 
     p = add("dream", "run a pass yourself as the model, from any harness; no API key needed")
+    p.add_argument("--personal", dest="personal_scope", action="store_true", help="act on your personal memory itself (notes from chat apps), not a project")
     p.add_argument("action", choices=["start", "memory", "search", "finish", "abort"])
     p.add_argument("arg", nargs="?", help="memory: JSON command (default: stdin); search: regex")
     p.add_argument("--max", type=int, default=8, help="search: max results")
@@ -58,6 +63,7 @@ def main(argv=None):
     add("sync", "refresh the memory copies injected into instruction files")
 
     p = add("run", "run a dreaming pass over new session transcripts")
+    p.add_argument("--personal", dest="personal_scope", action="store_true", help="act on your personal memory itself (notes from chat apps), not a project")
     p.add_argument("--auto", action="store_true", help="hook mode: respect the threshold and failure backoff")
     p.add_argument("--engine", default="", help="auto | api | claude-code | codex | cursor | none (default: config)")
     p.add_argument("--force", action="store_true", help="dream even below the new-activity threshold")
@@ -77,8 +83,19 @@ def main(argv=None):
         parser.print_help()
         return 1
 
+    if args.command == "mcp":
+        repo_dir = Path(args.repo_dir).resolve()
+        if args.print_config:
+            print(mcp.client_config(repo_dir if args.repo_dir != "." else None))
+            return 0
+        mcp.serve(repo_dir)
+        return 0
+
     root = repo.find_root(Path(args.repo_dir))
-    cfg = DreamerConfig.load(root)
+    if getattr(args, "personal_scope", False):
+        root = personal.home()
+        personal.ensure_store()
+    cfg = personal.adapt(root, DreamerConfig.load(root))
     mem = root / cfg.memory.dir
 
     if args.command == "init":
@@ -222,6 +239,21 @@ def main(argv=None):
                 break
         if not args.dry_run:
             targets.sync(root, cfg)  # also picks up hand edits to MEMORY.md
+        # Notes left for personal memory (chat apps, other repositories) are
+        # consolidated by a personal-only pass, triggered from opted-in repos.
+        if code == 0 and not args.dry_run and not personal.is_root(root) and personal.enabled(root) \
+                and notes.pending(personal.home()):
+            home = personal.home()
+            pcfg = DreamerConfig.load(home) if (home / "dreamer.toml").exists() else DreamerConfig()
+            if not (home / "dreamer.toml").exists():
+                pcfg.dream, pcfg.model = cfg.dream, cfg.model
+            pcfg = personal.adapt(home, pcfg)
+            try:
+                res = engines.run(home, pcfg, engine=args.engine, auto=args.auto)
+                _print(args.quiet, sdir, f"personal: {res.status}: {res.message}".strip())
+            except (repo.Busy, DreamError) as e:
+                _print(args.quiet, sdir, f"personal pass skipped: {e}", err=True)
+            targets.sync(root, cfg)
         return code
 
     return 1

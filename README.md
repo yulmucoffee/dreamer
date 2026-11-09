@@ -47,6 +47,32 @@ dreamer init --harness claude,codex,cursor
   - 다른 레포의 로컬 사본은 그 레포의 다음 `run`이나 훅, 또는 `dreamer sync` 때 갱신됩니다.
 - **주의:** 개인 저장소는 켠 레포 모두에 주입됩니다. 고객별로 비밀 유지가 필요한 레포들 사이에서는 켜지 않는 것이 안전합니다.
 
+### 채팅 앱과 MCP 클라이언트 (`dreamer mcp`)
+
+Claude Desktop 같은 채팅 앱은 레포 파일을 읽지 못합니다. 그래서 같은 메모리를 MCP(stdio)로도 제공합니다.
+
+```bash
+dreamer mcp --print-config                 # 채팅 앱용: 개인 메모리만
+dreamer mcp --print-config --repo-dir .    # 이 프로젝트 + (켰다면) 개인 메모리
+```
+
+- **도구:** `memory_recall`(인덱스), `memory_read`(페이지), `memory_search`, `memory_note`(`about`: `me` 또는 `project`).
+- **페이지는 읽기 전용:** 쓰기는 노트로만 받고, 다음 드리밍이 통합합니다. 에이전트마다 직접 덧붙이게 하면 중복과 오류가 모든 에이전트에 퍼지기 때문입니다. 검증, 예산, 실패 시 무기록 규칙은 그대로 적용됩니다.
+- **범위:** 개인 메모리를 켜지 않은 레포에서 띄운 서버는 개인 메모리를 노출하지 않습니다.
+- **개인 전용 패스:** 채팅 앱이 남긴 개인 노트는 `dreamer run --personal`(또는 `dreamer dream --personal start`)로 정리합니다. 개인 메모리를 켠 레포의 다음 `run`이나 훅이 노트가 쌓여 있으면 자동으로 이 패스도 실행합니다.
+- **ChatGPT:** 원격(HTTPS) MCP만 지원하므로 이 로컬 서버를 직접 붙일 수 없습니다. GPT는 Codex CLI로 참여합니다.
+
+[Notion의 공유 메모리](https://x.com/NotionHQ/status/2118059335930744999)와 같은 문제("모든 에이전트에 하나의 두뇌")를 다른 방식으로 풉니다.
+
+| | Notion 공유 메모리 | dreamer |
+|---|---|---|
+| 저장 위치 | 호스팅되는 Notion 워크스페이스 | 레포의 `memory/`(git으로 버전 관리) + 로컬 개인 저장소 |
+| 채팅 앱 | ChatGPT, Claude 웹 (원격 MCP) | Claude Desktop 등 로컬 MCP 클라이언트 |
+| 쓰기 | 에이전트가 직접 저장, 하루 1회 점검 작업 | 노트·트랜스크립트 → 드리밍이 원문과 대조하며 통합 |
+| 근거 | 대화 로그를 저장하지 않음 | 세션 트랜스크립트로 노트를 검증 |
+| 크기 관리 | 수동 검토 권장 | 하드 예산, 링크·고립 페이지 검증 |
+| 공유 스킬 | 지원 | 아직 없음 |
+
 ### 누가 드리밍을 하나 (엔진)
 
 자동 패스의 모델 역할은 `[dream] engine`이 정합니다. Anthropic API 키가 없어도, 이미 쓰고 있는 에이전트 구독으로 돌아갑니다.
@@ -141,6 +167,9 @@ dreamer dream start         # API 없이, 지금 쓰는 에이전트가 직접 �
 dreamer note "pnpm만 사용; npm은 lockfile을 깨뜨림"   # 아무 하네스에서나 메모리 입력 남기기
 dreamer sync                # MEMORY.md를 손으로 고친 뒤 AGENTS.md·개인 사본 갱신
 dreamer personal on|off|show   # 이 레포에서 개인 메모리 켜기/끄기/보기
+dreamer note --personal "..."  # 나에 관한 노트 (채팅 앱은 MCP memory_note)
+dreamer run --personal         # 개인 노트만 드리밍
+dreamer mcp                    # MCP 서버 (채팅 앱, 기타 MCP 클라이언트)
 dreamer run --batches 10    # 기존 세션 백로그를 한 번에 처리
 dreamer run --dry-run       # 적용·커서 이동 없이 미리보기
 dreamer status              # 백로그, 용량, 최근 패스와 토큰 사용량

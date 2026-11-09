@@ -30,7 +30,7 @@ from dreamer.transcripts import MARKER
 
 PROMPT = (
     MARKER + " Consolidate this repository's long-term memory. From the repository root run "
-    "`dreamer dream start{force}` and follow the instructions it prints exactly, using only `dreamer dream ...` "
+    "`dreamer dream {personal}start{force}` and follow the instructions it prints exactly, using only `dreamer dream ...` "
     "commands, until `dreamer dream finish` reports applied or unchanged. Do not edit any other file. "
     "If `dreamer dream start` reports skipped, stop."
 )
@@ -56,8 +56,8 @@ def resolve(cfg: DreamerConfig, requested: str = "") -> Optional[str]:
     return None
 
 
-def command(cfg: DreamerConfig, engine: str, force: bool) -> List[str]:
-    prompt = PROMPT.format(force=" --force" if force else "")
+def command(cfg: DreamerConfig, engine: str, force: bool, personal_pass: bool = False) -> List[str]:
+    prompt = PROMPT.format(force=" --force" if force else "", personal="--personal " if personal_pass else "")
     if cfg.dream.engine_command:  # custom harness: "mycli --headless {prompt}"
         return [a.replace("{prompt}", prompt) for a in shlex.split(cfg.dream.engine_command)]
     if engine not in CLI:
@@ -89,7 +89,8 @@ def run(root: Path, cfg: DreamerConfig, *, engine: str = "", auto: bool = False,
         gated = dream._gate(root, cfg, sdir, state, dream._gather(root, cfg, state), force, False)
         if gated:
             return gated
-    cmd = command(cfg, name, force)
+    from dreamer import personal
+    cmd = command(cfg, name, force, personal.is_root(root))
     with repo.lock(sdir, "engine.lock"):  # one engine at a time; a second hook just skips
         return _launch(root, cfg, sdir, name, cmd)
 

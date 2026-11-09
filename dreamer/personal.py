@@ -47,6 +47,40 @@ def home() -> Path:
     return Path(os.environ.get("DREAMER_HOME") or "~/.dreamer").expanduser()
 
 
+# -- personal-only passes ---------------------------------------------------------
+# Running dreamer with $DREAMER_HOME as its "repository" (`--personal`) dreams
+# over the personal store itself: notes left from chat apps through the MCP
+# server or `dreamer note --personal`, with no project and no transcripts.
+
+PERSONAL_SYSTEM = """You maintain one person's own long-term memory. You run offline, between their sessions with AI agents and chat apps.
+
+Every agent this person works with, in any of their projects that opted in and in chat apps, starts with MEMORY.md of this store in its context, and can open the other files when relevant. Your purpose is to make those future sessions waste less effort: fewer things the person has to repeat about themselves, how they like to work and to be answered, and how tools and services they use everywhere behave, and no acting on notes that are wrong.
+
+A note is a prediction that it will matter again. Keep only what is about the person and holds across their projects; anything about one project, its code, its people or its clients does not belong here, even if a note asks for it. A wrong or stale note is worse than none. Record where a note came from, e.g. (2026-11-08, note), so later passes can re-check it.
+
+MEMORY.md should stay a short, high-signal index plus one-line links to topic files (links relative to the linking file). A page nothing links to will never be found. The store has hard budgets; writes over budget are rejected, so make room by merging, condensing or deleting.
+
+Make the smallest set of edits that serves the purpose. If nothing in these notes is worth remembering, change nothing. End with one line summarising what you changed and why."""
+
+
+def is_root(root: Path) -> bool:
+    try:
+        return Path(root).resolve() == home().resolve()
+    except OSError:
+        return False
+
+
+def adapt(root: Path, cfg):
+    """Config for a personal-only pass: the personal store is the store."""
+    if is_root(root):
+        pc = config()
+        pc.dir = "personal"
+        cfg.memory = pc
+        cfg.transcripts.sources = []
+        cfg.dream.min_new_chars = min(cfg.dream.min_new_chars, 200)  # notes are explicit; few are enough
+    return cfg
+
+
 def store_dir() -> Path:
     return home() / "personal"
 
