@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest import mock
 
-from dreamer import dream, install, repo, store, transcripts
+from dreamer import dream, install, notes, repo, store, targets, transcripts
 from dreamer.config import DreamerConfig
 from dreamer.llm import DreamError
 
@@ -149,7 +149,7 @@ class TestTranscripts(Base):
     def test_cursor_is_incremental_and_skips_partial_lines(self):
         self.transcript(self.root, "s1", self.basic_session(self.root, "FIRST"), partial='{"type": "user"')
         b1 = transcripts.collect(self.root, self.cfg, {}, 100000)
-        cursors = {k: {"offset": v} for k, v in b1.offsets.items()}
+        cursors = b1.cursors
         p = self.transcript(self.root, "s1", [])
         with open(p, "a") as f:  # finish the partial line, add a new record
             f.write(', "cwd": "/nowhere"}\n' + json.dumps(rec(self.root, "user", "SECOND message here")) + "\n")
@@ -342,7 +342,7 @@ class TestInstall(Base):
 
         md = (self.root / "CLAUDE.md").read_text()
         self.assertTrue(md.startswith("# Team rules\nKeep it tidy."))
-        self.assertEqual(md.count(install.BLOCK_BEGIN), 1)
+        self.assertEqual(md.count(targets.BLOCK_BEGIN), 1)
         self.assertIn("@memory/MEMORY.md", md)
         data = json.loads(settings.read_text())
         self.assertEqual(data["permissions"], {"allow": ["Bash(ls)"]})
@@ -371,6 +371,192 @@ class TestInstall(Base):
         self.assertFalse((self.root / "MEMORY.md").exists())
         self.assertIn("[db](db.md)", (self.root / "memory" / "MEMORY.md").read_text())
         self.assertEqual(store.validate(self.root / "memory", self.cfg.memory), [])
+
+
+def codex_rec(t, payload, ts="2026-11-09T10:00:00Z"):
+    return {"timestamp": ts, "type": t, "payload": payload}
+
+
+class TestCodex(Base):
+    def rollout(self, cwd, sid, items, name=None):
+        d = self.codex / "sessions" / "2026" / "11" / "09"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / (name or f"rollout-2026-11-09T10-00-00-{sid}.jsonl")
+        with open(p, "a", encoding="utf-8") as f:
+            for r in [codex_rec("session_meta", {"id": sid, "cwd": str(cwd), "timestamp": "x", "git": {"branch": "dev"}})] + items:
+                f.write(json.dumps(r) + "\n")
+        return p
+
+    def setUp(self):
+        super().setUp()
+        self.codex = self.tmp / "codex"
+        self.env2 = mock.patch.dict(os.environ, {"CODEX_HOME": str(self.codex)})
+        self.env2.start()
+
+    def tearDown(self):
+        self.env2.stop()
+        super().tearDown()
+
+    def session(self, marker):
+        return [
+            codex_rec("turn_context", {"cwd": str(self.root)}),
+            codex_rec("response_item", {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "# AGENTS.md instructions for proj\nINJECTED-RULES"},
+                {"type": "input_text", "text": "<environment_context><cwd>/x</cwd></environment_context>"},
+                {"type": "input_text", "text": f"Use uv, not pip. {marker}"}]}),
+            codex_rec("response_item", {"type": "reasoning", "summary": [], "encrypted_content": "REASONING-SECRET"}),
+            codex_rec("response_item", {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": f"Switched to uv. {marker}"}]}),
+            codex_rec("response_item", {"type": "function_call", "name": "shell", "call_id": "c1",
+                                        "arguments": json.dumps({"command": ["bash", "-lc", 'git commit -m "build: use uv because pip resolver breaks"']})}),
+            codex_rec("response_item", {"type": "function_call_output", "call_id": "c1",
+                                        "output": json.dumps({"output": "error: lockfile stale", "metadata": {"exit_code": 1}})}),
+            codex_rec("response_item", {"type": "custom_tool_call", "name": "apply_patch", "call_id": "c2",
+                                        "input": "*** Begin Patch\n*** Update File: pyproject.toml\n@@\n-x\n+y\n*** End Patch"}),
+            codex_rec("response_item", {"type": "custom_tool_call_output", "call_id": "c2", "output": "Done!"}),
+        ]
+
+    def test_codex_digest_is_scoped_and_clean(self):
+        self.rollout(self.root, "codex-mine-1", self.session("MINE"))
+        foreign = self.rollout(self.other, "codex-other-1", self.session("THEIRS"))
+        b = transcripts.collect(self.root, self.cfg, {}, 100000)
+        for want in ("USER: Use uv, not pip. MINE", "ASSISTANT: Switched to uv.", "commit message: build: use uv because pip resolver breaks",
+                     "✗ error: lockfile stale", "apply_patch: files=pyproject.toml", "· codex", "branch dev"):
+            self.assertIn(want, b.text)
+        for leaked in ("THEIRS", "INJECTED-RULES", "environment_context", "REASONING-SECRET"):
+            self.assertNotIn(leaked, b.text)
+        # The other repo's session is marked foreign after its header and never read again.
+        entry = b.cursors[str(foreign)]
+        self.assertTrue(entry["ctx"]["foreign"])
+        self.assertEqual(entry["offset"], foreign.stat().st_size)
+        self.assertIn("MINE", transcripts.search(self.root, self.cfg, "uv"))
+        self.assertNotIn("THEIRS", transcripts.search(self.root, self.cfg, "uv"))
+
+    def test_codex_cursor_keeps_session_cwd(self):
+        p = self.rollout(self.root, "codex-mine-2", self.session("FIRST"))
+        b1 = transcripts.collect(self.root, self.cfg, {}, 100000)
+        with open(p, "a") as f:  # resumed later: no new header, cwd comes from the cursor
+            f.write(json.dumps(codex_rec("response_item", {"type": "message", "role": "user",
+                                                           "content": [{"type": "input_text", "text": "SECOND turn"}]})) + "\n")
+        b2 = transcripts.collect(self.root, self.cfg, b1.cursors, 100000)
+        self.assertIn("SECOND turn", b2.text)
+        self.assertNotIn("FIRST", b2.text)
+
+
+class TestHarnesses(Base):
+    def test_agents_md_gets_inline_copy_that_follows_memory(self):
+        agents = self.root / "AGENTS.md"
+        self.assertTrue(agents.exists(), "init targets AGENTS.md by default")
+        mem = self.root / "memory"
+        (mem / "MEMORY.md").write_text("# Project memory\n## Rules\n- [build](build.md): use uv\n- [web](https://x.io)\n")
+        (mem / "build.md").write_text("# build\n")
+        self.assertEqual(targets.stale(self.root, self.cfg), ["AGENTS.md"])
+        self.assertEqual(targets.sync(self.root, self.cfg), ["AGENTS.md"])
+        text = agents.read_text()
+        self.assertIn("[build](memory/build.md): use uv", text)
+        self.assertIn("[web](https://x.io)", text)
+        self.assertIn("### Rules", text)
+        self.assertIn("dreamer note", text)
+        claude = (self.root / "CLAUDE.md").read_text()
+        self.assertIn("@memory/MEMORY.md", claude)
+        self.assertNotIn("use uv", claude, "CLAUDE.md imports instead of copying")
+        self.assertEqual(targets.stale(self.root, self.cfg), [])
+
+    def test_gemini_target_and_uninstall(self):
+        (self.root / "GEMINI.md").write_text("# Gemini rules\n")
+        install.init(self.root, self.cfg)
+        self.assertIn("@memory/MEMORY.md", (self.root / "GEMINI.md").read_text())
+        install.uninstall(self.root)
+        self.assertEqual((self.root / "GEMINI.md").read_text(), "# Gemini rules\n")
+        self.assertFalse((self.root / "AGENTS.md").exists(), "a file created only for the block is removed")
+
+    def test_notes_feed_passes_are_consumed_and_restored_by_undo(self):
+        notes.add(self.root, "Cursor agent: the staging DB needs VPN " + "x" * 80, "cursor")
+        self.assertTrue((self.root / ".dreamer" / "inbox").is_dir())
+        exclude = (self.root / ".git" / "info" / "exclude").read_text()
+        self.assertIn(".dreamer/", exclude)
+        script = [
+            resp(tool("memory", {"command": "str_replace", "path": "/memories/MEMORY.md", "old_str": "# Project memory\n",
+                                 "new_str": "# Project memory\n- Staging DB needs VPN (cursor note)\n"}, 1), stop="tool_use"),
+            resp(text("Recorded VPN requirement.")),
+        ]
+        # A failed pass keeps the note.
+        with self.assertRaises(DreamError):
+            self.run_pass([RuntimeError("boom")])
+        self.assertEqual(len(notes.pending(self.root)), 1)
+        res, client = self.run_pass(script)
+        self.assertEqual(res.status, "applied")
+        prompt = client.requests[0]["messages"][0]["content"]
+        self.assertIn("Notes recorded by agents", prompt)
+        self.assertIn("cursor) Cursor agent: the staging DB needs VPN", prompt)
+        self.assertEqual(notes.pending(self.root), [])
+        self.assertIn("Staging DB needs VPN", (self.root / "AGENTS.md").read_text(), "AGENTS.md synced after apply")
+        dream.undo(self.root, self.cfg)
+        self.assertEqual(len(notes.pending(self.root)), 1, "undo puts consumed notes back")
+        self.assertNotIn("Staging DB needs VPN", (self.root / "AGENTS.md").read_text())
+
+
+class TestAgentDriven(Base):
+    def cli(self, *argv, stdin=None):
+        from dreamer import cli
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch("sys.stdin", io.StringIO(stdin or "")):
+            code = cli.main(list(argv) + ["--repo-dir", str(self.root)])
+        return code, out.getvalue()
+
+    def test_full_pass_through_cli(self):
+        self.transcript(self.root, "s1", self.basic_session(self.root, "MINE"))
+        code, out = self.cli("dream", "start", "--force")
+        self.assertEqual(code, 0)
+        for want in ("dreamer dream memory", "=== SYSTEM PROMPT ===", "=== USER MESSAGE ===", "MINE", "dreamer dream finish"):
+            self.assertIn(want, out)
+        # Another driver can't start while this pass is open.
+        self.assertEqual(dream.run(self.root, self.cfg, client_factory=lambda: 1 / 0).status, "skipped")
+
+        code, out = self.cli("dream", "memory", stdin=json.dumps({"command": "create", "path": "/memories/build.md",
+                                                                   "file_text": "# Build\n- use pnpm (2026-11-01, s:sess-aaa)\n"}))
+        self.assertEqual((code, out.strip()), (0, "File created successfully at: /memories/build.md"))
+        code, out = self.cli("dream", "memory", json.dumps({"command": "create", "path": "/memories/../x.md", "file_text": "x"}))
+        self.assertEqual(code, 1)
+        self.assertIn("Error", out)
+        code, out = self.cli("dream", "search", "pnpm")
+        self.assertIn("pnpm build", out)
+
+        # build.md is unreachable -> finish refuses and says why; nothing applied yet.
+        code, out = self.cli("dream", "finish")
+        self.assertEqual(code, 3)
+        self.assertIn("unreachable page", out)
+        self.assertFalse((self.root / "memory" / "build.md").exists())
+
+        self.cli("dream", "memory", json.dumps({"command": "str_replace", "path": "/memories/MEMORY.md",
+                                                 "old_str": "# Project memory\n", "new_str": "# Project memory\n- [build](build.md)\n"}))
+        code, out = self.cli("dream", "finish", "--summary", "added build rule")
+        self.assertEqual(code, 0, out)
+        self.assertTrue((self.root / "memory" / "build.md").exists())
+        self.assertIn("[build](memory/build.md)", (self.root / "AGENTS.md").read_text())
+        st = self.state()
+        self.assertTrue(st["files"])
+        self.assertEqual(st["runs"][-1]["mode"], "agent")
+        # Cursor advanced: nothing new to dream.
+        code, out = self.cli("dream", "start")
+        self.assertIn("skipped", out)
+
+    def test_abort_and_concurrent_edit(self):
+        self.transcript(self.root, "s1", self.basic_session(self.root, "MINE"))
+        dream.external_start(self.root, self.cfg)
+        self.assertTrue(dream.external_abort(self.root))
+        with self.assertRaises(DreamError):
+            dream.external_memory(self.root, self.cfg, {"command": "view", "path": "/memories"})
+        self.assertEqual(self.state()["files"], {})
+
+        dream.external_start(self.root, self.cfg)
+        dream.external_memory(self.root, self.cfg, {"command": "str_replace", "path": "/memories/MEMORY.md",
+                                                    "old_str": "# Project memory\n", "new_str": "# Project memory\n- a\n"})
+        (self.root / "memory" / "MEMORY.md").write_text("# Project memory\n- edited by hand meanwhile\n")
+        with self.assertRaises(DreamError):
+            dream.external_finish(self.root, self.cfg)
+        self.assertIn("by hand", (self.root / "memory" / "MEMORY.md").read_text())
+        self.assertEqual(self.state()["files"], {})
 
 
 class TestConfig(unittest.TestCase):

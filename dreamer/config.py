@@ -2,7 +2,7 @@ import json
 import sys
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 try:
     import tomllib  # Python 3.11+
@@ -48,8 +48,11 @@ class DreamConfig:
 
 @dataclass
 class TranscriptsConfig:
-    # Claude Code config dir; empty means $CLAUDE_CONFIG_DIR or ~/.claude.
-    claude_dir: str = ""
+    # Session transcripts to learn from. Other harnesses feed memory through
+    # `dreamer note`.
+    sources: List[str] = field(default_factory=lambda: ["claude", "codex"])
+    claude_dir: str = ""  # empty: $CLAUDE_CONFIG_DIR or ~/.claude
+    codex_dir: str = ""  # empty: $CODEX_HOME or ~/.codex
 
 
 @dataclass
@@ -131,5 +134,7 @@ max_failures = 3           # auto runs pause after this many failures in a row
 snapshots = 20
 
 [transcripts]
+sources = ["claude", "codex"]
 claude_dir = ""            # default: $CLAUDE_CONFIG_DIR or ~/.claude
+codex_dir = ""             # default: $CODEX_HOME or ~/.codex
 """

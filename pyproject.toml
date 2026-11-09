@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-dreamer"
-version = "0.2.0"
-description = "Offline memory consolidation (dreaming) for Claude Code projects"
+version = "0.3.0"
+description = "Offline memory consolidation (dreaming) for coding agents in any harness"
 readme = "README.md"
 authors = [
     { name = "yulmucoffee" }
