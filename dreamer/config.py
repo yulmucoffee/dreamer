@@ -44,13 +44,19 @@ class DreamConfig:
     # manual `dreamer run`.
     max_failures: int = 3
     snapshots: int = 20
+    # Who plays the model in automatic passes: auto | api | claude-code | codex | cursor | none.
+    # auto = api with Anthropic credentials, else the first of claude / codex / cursor-agent on PATH.
+    engine: str = "auto"
+    engine_model: str = ""  # passed to the CLI's --model / -m; empty = the CLI's default
+    engine_command: str = ""  # custom CLI, e.g. "mycli --headless {prompt}"
+    engine_timeout: int = 900
 
 
 @dataclass
 class TranscriptsConfig:
     # Session transcripts to learn from. Other harnesses feed memory through
     # `dreamer note`.
-    sources: List[str] = field(default_factory=lambda: ["claude", "codex"])
+    sources: List[str] = field(default_factory=lambda: ["claude", "codex", "captured"])
     claude_dir: str = ""  # empty: $CLAUDE_CONFIG_DIR or ~/.claude
     codex_dir: str = ""  # empty: $CODEX_HOME or ~/.codex
 
@@ -132,9 +138,13 @@ min_new_chars = 3000       # below this much new material, no API call is made
 batch_chars = 60000        # max digested transcript text per pass
 max_failures = 3           # auto runs pause after this many failures in a row
 snapshots = 20
+engine = "auto"            # auto | api | claude-code | codex | cursor | none
+engine_model = ""          # e.g. "haiku", "gpt-5-codex"; empty = the CLI's default
+engine_command = ""        # custom agent CLI: "mycli --headless {prompt}"
+engine_timeout = 900
 
 [transcripts]
-sources = ["claude", "codex"]
+sources = ["claude", "codex", "captured"]
 claude_dir = ""            # default: $CLAUDE_CONFIG_DIR or ~/.claude
 codex_dir = ""             # default: $CODEX_HOME or ~/.codex
 """

@@ -3,6 +3,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -68,7 +69,7 @@ class Base(unittest.TestCase):
         self.env.start()
         self.cfg = DreamerConfig.load(self.root)
         self.cfg.dream.min_new_chars = 50
-        install.init(self.root, self.cfg)
+        install.init(self.root, self.cfg, harnesses=["claude", "agents"])
 
     def tearDown(self):
         self.env.stop()
@@ -367,7 +368,7 @@ class TestInstall(Base):
         (self.root / "memory" / "MEMORY.md").unlink()
         (self.root / "MEMORY.md").write_text("# Old\n- [db](memory/db.md)\n")
         (self.root / "memory" / "db.md").write_text("# db\n")
-        install.init(self.root, self.cfg)
+        install.init(self.root, self.cfg, harnesses=["claude", "agents"])
         self.assertFalse((self.root / "MEMORY.md").exists())
         self.assertIn("[db](db.md)", (self.root / "memory" / "MEMORY.md").read_text())
         self.assertEqual(store.validate(self.root / "memory", self.cfg.memory), [])
@@ -464,7 +465,7 @@ class TestHarnesses(Base):
 
     def test_gemini_target_and_uninstall(self):
         (self.root / "GEMINI.md").write_text("# Gemini rules\n")
-        install.init(self.root, self.cfg)
+        install.init(self.root, self.cfg, harnesses=["gemini"])
         self.assertIn("@memory/MEMORY.md", (self.root / "GEMINI.md").read_text())
         install.uninstall(self.root)
         self.assertEqual((self.root / "GEMINI.md").read_text(), "# Gemini rules\n")
@@ -557,6 +558,189 @@ class TestAgentDriven(Base):
             dream.external_finish(self.root, self.cfg)
         self.assertIn("by hand", (self.root / "memory" / "MEMORY.md").read_text())
         self.assertEqual(self.state()["files"], {})
+
+
+class TestSharedAcrossHarnesses(Base):
+    """One person, several harnesses (or just one), one memory."""
+
+    def test_single_harness_detection_installs_only_that(self):
+        repo2 = self.tmp / "work" / "solo"
+        repo2.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo2, check=True)
+        home = self.tmp / "home-codex-only"
+        (home / ".codex").mkdir(parents=True)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), mock.patch("shutil.which", return_value=None):
+            self.assertEqual(install.detect_harnesses(repo2), ["codex"])
+            install.init(repo2, DreamerConfig())
+        self.assertTrue((repo2 / "AGENTS.md").exists())
+        self.assertFalse((repo2 / "CLAUDE.md").exists())
+        self.assertFalse((repo2 / ".claude").exists())
+        hooks = json.loads((repo2 / ".codex" / "hooks.json").read_text())
+        cmd = hooks["hooks"]["Stop"][0]["hooks"][0]
+        self.assertTrue(cmd["async"])
+        self.assertIn("dreamer run --auto", cmd["command"])
+        self.assertIn(".codex/hooks.json", (repo2 / ".git" / "info" / "exclude").read_text())
+        install.uninstall(repo2)
+        self.assertFalse((repo2 / ".codex" / "hooks.json").exists())
+
+    def test_existing_codex_hooks_are_preserved(self):
+        path = self.root / ".codex" / "hooks.json"
+        path.parent.mkdir()
+        mine = {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}],
+                          "PreToolUse": [{"matcher": "shell", "hooks": [{"type": "command", "command": "lint"}]}]}}
+        path.write_text(json.dumps(mine))
+        install.init(self.root, self.cfg, harnesses=["codex"])
+        install.init(self.root, self.cfg, harnesses=["codex"])
+        data = json.loads(path.read_text())
+        self.assertEqual(len(data["hooks"]["Stop"]), 2)
+        install.uninstall(self.root)
+        self.assertEqual(json.loads(path.read_text()), mine)
+
+    def cursor_event(self, name, **fields):
+        return json.dumps({"conversation_id": "conv-123", "generation_id": "g", "hook_event_name": name,
+                           "workspace_roots": [str(self.root)], "transcript_path": None, **fields})
+
+    def test_cursor_hooks_capture_sessions_into_the_digest(self):
+        install.init(self.root, self.cfg, harnesses=["cursor"])
+        hooks = json.loads((self.root / ".cursor" / "hooks.json").read_text())
+        self.assertEqual(set(hooks["hooks"]), set(install.CURSOR_EVENTS))
+        self.assertEqual(hooks["version"], 1)
+        script = self.root / install.CURSOR_SCRIPT
+        self.assertTrue(os.access(script, os.X_OK))
+        from dreamer import capture
+        with mock.patch.object(capture, "_trigger_dream") as trigger:
+            ans = capture.handle("cursor", self.cursor_event("beforeSubmitPrompt", prompt="Deploys go through make ship, never kubectl"), self.root)
+            self.assertEqual(json.loads(ans), {"continue": True})
+            capture.handle("cursor", self.cursor_event("afterAgentResponse", text="Understood, using make ship."), self.root)
+            capture.handle("cursor", self.cursor_event("afterShellExecution", command="make ship", output="Error: exit code 2", duration=3), self.root)
+            capture.handle("cursor", self.cursor_event("afterFileEdit", file_path="Makefile", edits=[]), self.root)
+            capture.handle("cursor", "not json", self.root)
+            capture.handle("cursor", self.cursor_event("sessionEnd", session_id="s", reason="user"), self.root)
+            trigger.assert_called_once()
+        b = transcripts.collect(self.root, self.cfg, {}, 100000)
+        for want in ("USER: Deploys go through make ship", "ASSISTANT: Understood", "→ Shell: command=make ship",
+                     "✗ Error: exit code 2", "→ Edit: file_path=Makefile", "· captured"):
+            self.assertIn(want, b.text)
+        self.assertIn("make ship", transcripts.search(self.root, self.cfg, "kubectl"))
+
+    def test_capture_ignores_repos_that_did_not_opt_in_and_dream_passes(self):
+        from dreamer import capture
+        stranger = self.tmp / "work" / "stranger"
+        stranger.mkdir()
+        ev = json.dumps({"conversation_id": "c", "hook_event_name": "beforeSubmitPrompt", "prompt": "hi",
+                         "workspace_roots": [str(stranger)]})
+        self.assertEqual(json.loads(capture.handle("cursor", ev, stranger)), {"continue": True})
+        self.assertFalse((stranger / ".dreamer").exists(), "no files appear in a repo without dreamer")
+        with mock.patch.dict(os.environ, {"DREAMER_DREAMING": "1"}):
+            capture.handle("cursor", self.cursor_event("beforeSubmitPrompt", prompt="inside a pass"), self.root)
+        self.assertFalse((self.root / ".dreamer" / "sessions").exists())
+
+    def test_dream_passes_never_feed_later_passes(self):
+        m = transcripts.MARKER
+        self.transcript(self.root, "dreampass", [
+            rec(self.root, "user", f"{m} Consolidate this repository's long-term memory.", sid="sess-dream"),
+            rec(self.root, "assistant", [{"type": "text", "text": "DREAM-SESSION-TEXT"}], sid="sess-dream")])
+        self.transcript(self.root, "normal", [
+            rec(self.root, "user", "dream", sid="sess-norm"),
+            rec(self.root, "assistant", [{"type": "tool_use", "id": "a", "name": "Bash",
+                                          "input": {"command": "dreamer dream memory '{\"command\":\"view\"}'"}}], sid="sess-norm"),
+            rec(self.root, "user", [{"type": "tool_result", "tool_use_id": "a", "content": f"{m}\nDIGEST-ECHO"}], sid="sess-norm"),
+            rec(self.root, "user", "REAL USER TEXT afterwards", sid="sess-norm")])
+        b = transcripts.collect(self.root, self.cfg, {}, 100000)
+        self.assertIn("REAL USER TEXT", b.text)
+        for leaked in ("DREAM-SESSION-TEXT", "DIGEST-ECHO", "dreamer dream memory"):
+            self.assertNotIn(leaked, b.text)
+        self.assertNotIn("DIGEST-ECHO", transcripts.search(self.root, self.cfg, "DIGEST"))
+
+    def test_hook_commands_do_nothing_inside_a_pass_or_without_dreamer(self):
+        bindir = self.tmp / "bin"
+        bindir.mkdir()
+        flag = self.tmp / "ran"
+        fake = bindir / "dreamer"
+        fake.write_text(f"#!/bin/sh\ntouch {flag}\n")
+        fake.chmod(0o755)
+        env = {"PATH": f"{bindir}:/usr/bin:/bin", "CLAUDE_PROJECT_DIR": str(self.root)}
+        for cmd in (install.SESSION_END_COMMAND, install.CODEX_STOP_COMMAND):
+            r = subprocess.run(["bash", "-c", cmd], env={**env, "DREAMER_DREAMING": "1"})
+            self.assertEqual(r.returncode, 0)
+            r = subprocess.run(["bash", "-c", cmd], env={"PATH": "/usr/bin:/bin", "CLAUDE_PROJECT_DIR": str(self.root)})
+            self.assertEqual(r.returncode, 0)
+        import time as _t
+        _t.sleep(0.3)
+        self.assertFalse(flag.exists())
+        subprocess.run(["bash", "-c", install.CODEX_STOP_COMMAND], env=env, cwd=self.root)
+        for _ in range(30):
+            if flag.exists():
+                break
+            _t.sleep(0.1)
+        self.assertTrue(flag.exists(), "outside a pass, the hook does start dreamer")
+
+    def test_state_lives_in_worktree_and_legacy_state_migrates(self):
+        repo2 = self.tmp / "work" / "legacy"
+        repo2.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo2, check=True)
+        legacy = repo2 / ".git" / "dreamer"
+        legacy.mkdir()
+        (legacy / "state.json").write_text(json.dumps({"version": 1, "files": {"x": {"offset": 5}}, "failures": 0, "runs": []}))
+        sdir = repo.state_dir(repo2)
+        self.assertEqual(sdir, repo2 / ".dreamer" / "state")
+        self.assertFalse(legacy.exists())
+        self.assertEqual(repo.load_state(sdir)["files"], {"x": {"offset": 5}})
+        self.assertIn(".dreamer/", (repo2 / ".git" / "info" / "exclude").read_text())
+
+
+class TestEngines(Base):
+    def fake_agent(self, body):
+        script = self.tmp / "fake_agent.py"
+        script.write_text("import os, subprocess, sys, json\n"
+                          "assert os.environ.get('DREAMER_DREAMING') == '1'\n"
+                          "assert '[dreamer:dream-pass]' in sys.argv[1]\n"
+                          "def d(*a, stdin=None):\n"
+                          "    return subprocess.run([sys.executable, '-m', 'dreamer.cli', 'dream', *a], input=stdin, text=True, capture_output=True)\n"
+                          + body)
+        self.cfg.dream.engine = "claude-code"
+        self.cfg.dream.engine_command = f"{sys.executable} {script} {{prompt}}"
+
+    def test_cli_engine_runs_the_agent_protocol(self):
+        self.transcript(self.root, "s1", self.basic_session(self.root, "MINE"))
+        self.fake_agent(
+            "out = d('start', '--force').stdout\n"
+            "assert 'SYSTEM PROMPT' in out and 'MINE' in out, out\n"
+            "d('memory', stdin=json.dumps({'command': 'str_replace', 'path': '/memories/MEMORY.md', "
+            "'old_str': '# Project memory\\n', 'new_str': '# Project memory\\n- pnpm only\\n'}))\n"
+            "r = d('finish', '--summary', 'pnpm rule')\n"
+            "assert r.returncode == 0, r.stdout\n")
+        from dreamer import engines
+        res = engines.run(self.root, self.cfg, force=True)
+        self.assertEqual(res.status, "applied", res)
+        self.assertIn("pnpm only", (self.root / "memory" / "MEMORY.md").read_text())
+        self.assertEqual(self.state()["runs"][-1]["mode"], "claude-code")
+        self.assertIn("pnpm only", (self.root / "AGENTS.md").read_text())
+
+    def test_cli_engine_that_does_not_finish_changes_nothing(self):
+        self.transcript(self.root, "s1", self.basic_session(self.root, "MINE"))
+        self.fake_agent("d('start', '--force')\n"
+                        "d('memory', json.dumps({'command': 'create', 'path': '/memories/x.md', 'file_text': 'x'}))\n")
+        from dreamer import engines
+        with self.assertRaises(DreamError):
+            engines.run(self.root, self.cfg, force=True)
+        self.assertFalse((self.root / "memory" / "x.md").exists())
+        self.assertEqual(self.state()["files"], {})
+        self.assertEqual(self.state()["failures"], 1)
+        self.assertFalse(dream._external_active(repo.state_dir(self.root)))
+
+    def test_auto_engine_choice(self):
+        from dreamer import engines
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}):
+            self.assertEqual(engines.resolve(self.cfg), "api")
+        env = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("shutil.which", side_effect=lambda b: "/x/codex" if b == "codex" else None):
+            self.assertEqual(engines.resolve(self.cfg), "codex")
+        self.assertIn("--full-auto", engines.command(self.cfg, "codex", False))
+        self.assertIn("Bash(dreamer dream:*)", engines.command(self.cfg, "claude-code", False))
+        with mock.patch.dict(os.environ, {"DREAMER_DREAMING": "1"}):
+            self.assertEqual(engines.run(self.root, self.cfg).status, "skipped")
 
 
 class TestConfig(unittest.TestCase):

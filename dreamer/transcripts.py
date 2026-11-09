@@ -3,8 +3,9 @@
 Sources:
 - Claude Code: ~/.claude/projects/<path-slug>/*.jsonl (or $CLAUDE_CONFIG_DIR)
 - Codex CLI:   ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl (or $CODEX_HOME)
-Harnesses without readable transcripts (Cursor, Gemini CLI, ...) feed memory
-through `dreamer note` instead (see notes.py).
+- Captured:    .dreamer/sessions/*.jsonl, written by harness hooks through
+               `dreamer capture` (Cursor; any harness with hooks)
+Any agent can also leave explicit observations with `dreamer note`.
 
 Isolation: a record is used only when the working directory it belongs to
 lies inside this repository (path-boundary check, so `proj` never matches
@@ -26,6 +27,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from dreamer.config import DreamerConfig
+
+# Every dreaming pass (headless engine prompt, `dreamer dream start` output)
+# carries this marker, so a pass is never fed back into a later pass.
+MARKER = "[dreamer:dream-pass]"
 
 USER_CLIP = 2000
 ASSISTANT_CLIP = 1500
@@ -121,11 +126,13 @@ def _tool_summary(name: str, inp: Any) -> str:
 
 
 def _tool_line(name: str, inp: Any, full: bool) -> str:
+    if isinstance(inp, dict) and "dreamer dream " in _as_cmd(inp.get("command", inp.get("cmd", ""))):
+        return ""  # the mechanics of a dreaming pass are not session activity
     return "→ " + (f"{name}: {json.dumps(inp, ensure_ascii=False)}" if full else _tool_summary(name, inp))
 
 
 def _result_line(text: str, is_error: bool, full: bool) -> Optional[str]:
-    if not text.strip():
+    if not text.strip() or MARKER in text:
         return None
     if is_error:
         return "  ✗ " + (text.strip() if full else _clip(text, RESULT_ERR_CLIP))
@@ -197,10 +204,34 @@ def render(record: Dict[str, Any], full: bool = False) -> List[str]:
     return out
 
 
+def _user_texts(rec: Dict[str, Any]) -> str:
+    msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
+    c = msg.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text")
+    return ""
+
+
+def _skip_session(ctx: Dict[str, Any], sid: str, text: str) -> bool:
+    """True for a dreaming pass's own session (and remembers it)."""
+    skipped = ctx.setdefault("skip", [])
+    if sid in skipped:
+        return True
+    if MARKER in text:
+        skipped.append(sid)
+        return True
+    return False
+
+
 def _claude_parse(rec: Dict[str, Any], ctx: Dict[str, Any], root: Path, full: bool):
     if not in_repo(rec.get("cwd"), root):
         return None
-    return render(rec, full), str(rec.get("sessionId", "")), str(rec.get("timestamp", "")), rec.get("gitBranch")
+    sid = str(rec.get("sessionId", ""))
+    if _skip_session(ctx, sid, _user_texts(rec) if rec.get("type") == "user" else ""):
+        return None
+    return render(rec, full), sid, str(rec.get("timestamp", "")), rec.get("gitBranch")
 
 
 # -- Codex CLI -----------------------------------------------------------------------
@@ -288,7 +319,37 @@ def _codex_parse(rec: Dict[str, Any], ctx: Dict[str, Any], root: Path, full: boo
         return None
     if t != "response_item" or not in_repo(ctx.get("cwd"), root):
         return None
+    if p.get("type") == "message" and p.get("role") == "user" and MARKER in json.dumps(p.get("content"), ensure_ascii=False):
+        ctx["foreign"] = True  # a dreaming pass run through Codex: never read it
+        return None
     return render_codex(p, full), ctx.get("sid", ""), str(rec.get("timestamp", "")), ctx.get("branch")
+
+
+# -- captured sessions (Cursor hooks, generic hooks) --------------------------------
+
+def _captured_files(root: Path, cfg: DreamerConfig) -> List[Path]:
+    d = root / ".dreamer" / "sessions"
+    return [p for p in d.glob("*.jsonl") if p.is_file() and not p.is_symlink()] if d.is_dir() else []
+
+
+def _captured_parse(rec: Dict[str, Any], ctx: Dict[str, Any], root: Path, full: bool):
+    if not in_repo(rec.get("cwd"), root):
+        return None
+    sid, kind = str(rec.get("session", "")), rec.get("kind")
+    if _skip_session(ctx, sid, str(rec.get("text", "")) if kind == "user" else ""):
+        return None
+    if kind in ("user", "assistant"):
+        text = _clean_user(str(rec.get("text", ""))) if kind == "user" else str(rec.get("text", ""))
+        lines = [_said(kind.upper(), text, full)] if text.strip() else []
+    elif kind == "tool":
+        lines = [_tool_line(str(rec.get("name", "tool")), rec.get("input"), full)]
+    elif kind == "result":
+        out = str(rec.get("output", ""))
+        line = _result_line(out, bool(rec.get("error")) or bool(_EXIT_FAIL.search(out)), full)
+        lines = [line] if line else []
+    else:
+        lines = []
+    return lines, sid, str(rec.get("ts", "")), None
 
 
 # -- sources -------------------------------------------------------------------------
@@ -297,6 +358,7 @@ Parser = Callable[[Dict[str, Any], Dict[str, Any], Path, bool], Optional[Tuple[L
 SOURCES: Dict[str, Tuple[Callable[[Path, DreamerConfig], List[Path]], Parser]] = {
     "claude": (_claude_files, _claude_parse),
     "codex": (_codex_files, _codex_parse),
+    "captured": (_captured_files, _captured_parse),
 }
 
 
@@ -361,8 +423,9 @@ def collect(root: Path, cfg: DreamerConfig, cursors: Dict[str, Any], budget: int
             if ctx.get("foreign"):  # another repo's session: skip the rest unread
                 new_offset = size
                 break
-            if got and got[0]:
+            if got and any(got[0]):
                 lines, sid, ts, branch = got
+                lines = [l for l in lines if l]
                 header = []
                 if sid != current:
                     current = sid
@@ -404,9 +467,9 @@ def search(root: Path, cfg: DreamerConfig, pattern: str, max_results: int = 8) -
             got = parse(rec, ctx, root, True) if isinstance(rec, dict) else None
             if ctx.get("foreign"):
                 break
-            if not got or not got[0]:
+            if not got or not any(got[0]):
                 continue
-            text = "\n".join(got[0])
+            text = "\n".join(l for l in got[0] if l)
             m = rx.search(text)
             if m:
                 a, b = max(0, m.start() - SEARCH_CONTEXT), min(len(text), m.end() + SEARCH_CONTEXT)

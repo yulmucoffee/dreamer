@@ -4,31 +4,55 @@
 
 앤트로픽 연구 [「The components of agent memory」](https://www.anthropic.com/research/components-of-agent-memory)의 **드리밍(dreaming)**을 코딩 에이전트 프로젝트에 적용하는 도구입니다. 세션이 끝나면 오프라인에서 그 세션을 되돌아보고, 다음 세션이 덜 헤매도록 프로젝트 메모리를 고칩니다. Claude Code, Codex, Cursor, Gemini CLI, Copilot 등 **하네스와 모델에 상관없이** 쓸 수 있습니다.
 
-## 하네스 지원
+## 한 사람, 여러 에이전트, 하나의 메모리
 
-| 하네스 | 메모리 주입 | 드리밍 입력 | 드리밍 실행 |
+Claude Code, Codex(GPT), Cursor를 번갈아 써도 모두 같은 `memory/`를 읽고 같은 메모리에 기여합니다. Claude Code에서 알게 된 것이 다음 Cursor 세션에 주입되고, 그 반대도 마찬가지입니다. 에이전트를 하나만 쓰는 경우도 같은 구성의 일부일 뿐입니다.
+
+```bash
+dreamer init                          # 설치된 CLI를 보고 하네스를 자동 감지
+dreamer init --harness codex          # 에이전트 하나만 (예: GPT/Codex만 쓸 때)
+dreamer init --harness claude,codex,cursor
+```
+
+| 하네스 | 메모리 주입 | 세션 수집 | 자동 드리밍 트리거 |
 |---|---|---|---|
-| Claude Code | `CLAUDE.md`의 `@memory/MEMORY.md` import | 세션 트랜스크립트 자동 수집, SessionEnd 훅 | API 엔진, 또는 에이전트가 직접 |
-| Codex CLI | `AGENTS.md` 인라인 사본 | 세션 rollout 자동 수집 (`~/.codex/sessions`) | 에이전트가 직접 (`dreamer dream`) |
-| Cursor, Copilot, Windsurf, Amp, opencode, Zed 등 AGENTS.md 계열 | `AGENTS.md` 인라인 사본 | `dreamer note` | 에이전트가 직접 |
-| Gemini CLI | `GEMINI.md`의 `@memory/MEMORY.md` import | `dreamer note` | 에이전트가 직접 |
-| 그 밖의 셸 접근 가능한 에이전트 | 지시 파일에 `memory/MEMORY.md` 안내 | `dreamer note` | 에이전트가 직접 |
+| Claude Code | `CLAUDE.md`의 `@memory/MEMORY.md` import | 트랜스크립트 자동 수집 (`~/.claude/projects`) | SessionEnd 훅 (`.claude/settings.local.json`) |
+| Codex CLI (GPT) | `AGENTS.md` 인라인 사본 | rollout 자동 수집 (`~/.codex/sessions`) | Stop 훅, 비동기 (`.codex/hooks.json`) |
+| Cursor | `AGENTS.md` 인라인 사본 | 훅으로 기록: 프롬프트, 응답, 셸 명령과 출력, 편집 파일 (`.cursor/hooks.json`) | sessionEnd 훅 |
+| Gemini CLI | `GEMINI.md`의 `@memory/MEMORY.md` import | `dreamer note` | `--git-hook` 또는 수동 |
+| Copilot, Windsurf, Amp, opencode, Zed 등 | `AGENTS.md` 인라인 사본 (`--harness agents`) | `dreamer note`, 훅이 있으면 `dreamer capture generic` | `--git-hook` 또는 수동 |
 
-- **API 엔진**(`dreamer run`): Claude API를 씁니다. 프리셋이나 멀티프로바이더 없이 Claude 전용입니다.
-- **에이전트 주도 드리밍**(`dreamer dream …`): 어느 하네스의 어떤 모델이든, 사용자가 "dream"이라고 하면 에이전트가 직접 패스를 수행합니다. API 키가 필요 없고, 예산, 경로 제한, 검증, 스냅샷, 커서는 API 엔진과 같은 코드를 탑니다.
-- **AGENTS.md는 인라인 사본입니다.** AGENTS.md에는 import 문법이 없기 때문입니다. 메모리가 바뀔 때마다 자동으로 동기화되고, 링크는 `memory/` 기준으로 고쳐집니다.
-- **중복 주입 없음(기본 설정):** Claude Code는 `CLAUDE.md`가 있으면 기본적으로 `AGENTS.md`를 읽지 않습니다. Project instructions를 `claude-md-and-agents-md`로 바꾼 경우에만 인덱스가 두 번 들어갑니다.
+훅 설정 파일은 모두 레포 안의 프로젝트 단위 파일입니다. 새로 만든 파일은 `.git/info/exclude`로 커밋에서 빠지고, 이미 추적 중인 파일에는 항목만 더합니다. dreamer가 없는 팀원에게 훅은 아무 일도 하지 않습니다.
+
+### 누가 드리밍을 하나 (엔진)
+
+자동 패스의 모델 역할은 `[dream] engine`이 정합니다. Anthropic API 키가 없어도, 이미 쓰고 있는 에이전트 구독으로 돌아갑니다.
+
+| engine | 실행 | 필요한 것 |
+|---|---|---|
+| `api` | 내장 루프, Claude API | Anthropic 자격 증명 |
+| `claude-code` | `claude -p` (헤드리스) | Claude 구독 |
+| `codex` | `codex exec --full-auto` | ChatGPT/OpenAI 로그인 |
+| `cursor` | `cursor-agent -p --force` | Cursor 플랜 |
+| `auto` (기본) | Anthropic 자격 증명이 있으면 `api`, 없으면 PATH에 있는 첫 CLI (claude → codex → cursor-agent) | |
+| `none` | 자동 드리밍 끔. 에이전트에게 "dream"이라고 말해 직접 실행 | |
+
+- **CLI 엔진은 대화형 "dream"과 같은 프로토콜**(`dreamer dream start … finish`)을 탑니다. 예산, 검증, 스냅샷, 커서가 어떤 모델이든 같게 적용됩니다. 끝내지 못하면 아무것도 바뀌지 않고 실패로 기록됩니다.
+- **세부 설정:** `engine_model`(예: `haiku`)로 모델을, `engine_command`로 다른 에이전트 CLI를 지정할 수 있습니다.
+- **재귀 방지:** 엔진은 `DREAMER_DREAMING=1` 환경 변수로 실행되고, 모든 dreamer 훅은 이 값을 보면 즉시 종료합니다. 패스 프롬프트에는 마커가 들어 있어서, 드리밍 세션 자신의 트랜스크립트는 다음 패스에 들어가지 않습니다.
+- **주입 방식:** AGENTS.md에는 import 문법이 없어서 인라인 사본을 넣습니다. 메모리가 바뀔 때마다 동기화되고 링크는 `memory/` 기준으로 고쳐집니다.
+- **중복 주입 없음:** Claude Code는 `CLAUDE.md`가 있으면 기본적으로 `AGENTS.md`를 읽지 않습니다.
 
 ## 동작 방식
 
 ```
-에이전트 노트 (dreamer note, 모든 하네스)  +  세션 트랜스크립트 (Claude Code, Codex; 이 레포 것만)
+세션 기록: Claude Code·Codex 트랜스크립트, Cursor 훅 기록, dreamer note  (이 레포 것만)
    │  증분 커서: 각 세션은 한 번만 읽음
    ▼
 다이제스트  ── 사고 블록·파일 덤프·성공 출력은 잘라내고, 사용자 발화·결정·에러는 남김 (실측 ~100×+ 압축)
    │  새 분량이 임계값 미만이면 API 호출 없음
    ▼
-모델 (memory 도구로 편집 + 원문 검색으로 대조; Claude API 또는 하네스의 에이전트)
+모델 (memory 도구로 편집 + 원문 검색으로 대조; Claude API 또는 claude / codex / cursor 에이전트)
    │  스테이징 사본에서 작업 → 검증 → 원자적 적용
    ▼
 memory/MEMORY.md   ← CLAUDE.md / GEMINI.md import, AGENTS.md 사본으로 매 세션 주입 (작게 유지)
@@ -70,8 +94,8 @@ memory/<topic>.md  ← 필요할 때 에이전트가 열어 봄
   - `CLAUDE.md`의 관리 블록
   - `.claude/settings.local.json` (개인용, `.git/info/exclude`로 커밋 제외)
   - `AGENTS.md`, `GEMINI.md`의 관리 블록
-  - `.dreamer/inbox/` (노트, `.git/info/exclude`로 커밋 제외)
-  - `.git/dreamer/` (상태·로그·스냅샷, 워크트리별)
+  - `.claude/settings.local.json`, `.codex/hooks.json`, `.cursor/hooks.json`의 dreamer 항목
+  - `.dreamer/`: 상태, 로그, 스냅샷, 노트, Cursor 세션 기록. 워크트리별이고 `.git/info/exclude`로 커밋에서 제외됩니다. `.git/` 아래가 아닌 이유는 Codex 샌드박스가 `.git/`을 읽기 전용으로 두기 때문입니다.
 
   `~/.claude/settings.json`이나 전역 git 설정은 건드리지 않습니다.
 - **memory 도구**: 메모리 디렉터리 밖 경로, `..`, 심볼릭 링크, `.md`가 아닌 파일을 거부합니다.
@@ -82,14 +106,14 @@ memory/<topic>.md  ← 필요할 때 에이전트가 열어 봄
 ```bash
 pip install -e .            # Python 3.10+
 cd your-project
-dreamer init                # memory/, CLAUDE.md·AGENTS.md 블록(+GEMINI.md가 있으면), SessionEnd 훅
+dreamer init                # 하네스 감지 → memory/, 지시 파일 블록, 훅
 git add memory CLAUDE.md AGENTS.md && git commit -m "chore: add project memory"
 ```
 
 드리밍에는 Claude 자격 증명이 필요합니다: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, 또는 `ant auth login` 프로필.
 
 ```bash
-dreamer run                 # Claude API로 패스 실행 (임계값 무시하려면 --force)
+dreamer run                 # 엔진으로 패스 실행 (임계값 무시: --force, 엔진 지정: --engine codex)
 dreamer dream start         # API 없이, 지금 쓰는 에이전트가 직접 패스 실행 (출력된 안내를 따름)
 dreamer note "pnpm만 사용; npm은 lockfile을 깨뜨림"   # 아무 하네스에서나 메모리 입력 남기기
 dreamer sync                # MEMORY.md를 손으로 고친 뒤 AGENTS.md 사본 갱신
@@ -103,9 +127,9 @@ dreamer config              # dreamer.toml 예시 출력
 ```
 
 `init` 옵션:
-- `--harness claude,agents,gemini`: 주입 대상 지정
+- `--harness claude,codex,cursor,gemini,agents`: 대상 하네스 지정 (기본: 자동 감지)
 - `--git-hook`: 하네스와 무관하게 커밋마다 드리밍
-- `--no-session-hook`: Claude Code SessionEnd 훅 생략
+- `--no-hooks`: 세션 수집과 자동 드리밍 훅 생략
 - `--with-config`: `dreamer.toml` 생성
 기존 레이아웃(루트 `MEMORY.md`)은 `dreamer init` 실행 시 `memory/MEMORY.md`로 옮겨지고 링크도 고쳐집니다.
 

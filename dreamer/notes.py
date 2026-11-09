@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 from typing import List, Tuple
 
-INBOX = Path(".dreamer") / "inbox"
+INBOX = Path(".dreamer") / "inbox"  # repo.LOCAL_DIR
 NOTE_CLIP = 2000
 MAX_NOTES = 200  # beyond this, oldest notes are dropped rather than growing forever
 

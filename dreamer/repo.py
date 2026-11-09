@@ -1,13 +1,15 @@
 """Repository-scoped paths, state, locking and atomic file helpers.
 
 Everything dreamer writes lives inside the repository: the memory directory,
-a managed block in CLAUDE.md, .claude/settings.local.json, and private state
-under the (per-worktree) git dir. Nothing is written to $HOME or global config.
+managed blocks in instruction files, project-level hook configs, and private
+state under .dreamer/ (git-excluded). Nothing is written to $HOME or global
+config.
 """
 
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -35,13 +37,47 @@ def is_git(root: Path) -> bool:
     return _git(root, "rev-parse", "--git-dir") is not None
 
 
+LOCAL_DIR = ".dreamer"  # personal, never committed: state, inbox, captured sessions
+
+
 def state_dir(root: Path) -> Path:
-    """Private, never-committed state. Per worktree, because each worktree has
-    its own checkout of the memory directory."""
-    git_dir = _git(root, "rev-parse", "--absolute-git-dir")
-    d = Path(git_dir) / "dreamer" if git_dir else root / ".dreamer"
-    d.mkdir(parents=True, exist_ok=True)
+    """Private, never-committed state, inside the working tree (per worktree,
+    because each worktree has its own checkout of the memory directory).
+
+    Not under .git/: agent sandboxes such as Codex's workspace-write mode make
+    .git read-only, and agents must be able to run `dreamer dream` there."""
+    d = root / LOCAL_DIR / "state"
+    if not d.exists():
+        git_dir = _git(root, "rev-parse", "--absolute-git-dir")
+        legacy = Path(git_dir) / "dreamer" if git_dir else None
+        d.parent.mkdir(parents=True, exist_ok=True)
+        if legacy and legacy.is_dir():  # state from versions <= 0.3
+            try:
+                shutil.move(str(legacy), str(d))
+            except OSError:
+                pass
+        d.mkdir(parents=True, exist_ok=True)
+        exclude(root, LOCAL_DIR + "/")
     return d
+
+
+def exclude(root: Path, rel: str) -> None:
+    """Keep personal files out of commits via .git/info/exclude (not committed).
+    Best effort: inside a sandbox .git may be read-only."""
+    try:
+        if not is_git(root):
+            return
+        if subprocess.run(["git", "check-ignore", "-q", rel], cwd=root).returncode == 0:
+            return
+        path = git_path(root, "info/exclude")
+        if path is None:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        if rel not in text.splitlines():
+            path.write_text(text + ("" if text.endswith("\n") or not text else "\n") + rel + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def git_path(root: Path, rel: str) -> Optional[Path]:
@@ -77,11 +113,11 @@ class Busy(Exception):
 
 
 @contextlib.contextmanager
-def lock(sdir: Path):
+def lock(sdir: Path, name: str = "lock"):
     """Non-blocking exclusive lock so overlapping hooks never run two passes."""
     import fcntl
 
-    f = open(sdir / "lock", "w")
+    f = open(sdir / name, "w")
     try:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)

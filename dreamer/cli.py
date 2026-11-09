@@ -5,7 +5,7 @@ from pathlib import Path
 
 import json
 
-from dreamer import dream, install, notes, repo, store, targets, transcripts
+from dreamer import capture, dream, engines, install, notes, repo, store, targets, transcripts
 from dreamer.config import EXAMPLE_TOML, DreamerConfig
 from dreamer.llm import DreamError
 
@@ -26,12 +26,15 @@ def main(argv=None):
         p.add_argument("--repo-dir", default=".", help="repository (default: current directory)")
         return p
 
-    p = add("init", "set up memory and inject it into each harness's instruction file")
-    p.add_argument("--harness", default="", help="comma list of claude,agents,gemini (default: claude,agents"
-                   " + gemini if GEMINI.md exists). agents = AGENTS.md: Codex, Cursor, Copilot, Windsurf, Amp, ...")
-    p.add_argument("--no-session-hook", action="store_true", help="don't add the Claude Code SessionEnd hook")
+    p = add("init", "set up shared memory for the harnesses you use in this repository")
+    p.add_argument("--harness", default="", help="comma list of claude,codex,cursor,gemini,agents "
+                   "(default: detected from installed CLIs; agents = AGENTS.md only, for Copilot, Windsurf, Amp, ...)")
+    p.add_argument("--no-hooks", action="store_true", help="don't add harness hooks (session capture / auto dreaming)")
     p.add_argument("--git-hook", action="store_true", help="also dream after each commit (harness-independent)")
     p.add_argument("--with-config", action="store_true", help="write a dreamer.toml with the defaults")
+
+    p = add("capture", "record a harness hook event from stdin (used by installed hooks)")
+    p.add_argument("source", choices=["cursor", "generic"])
 
     p = add("note", "record an observation for the next dreaming pass (any harness)")
     p.add_argument("text", nargs="?", help="note text (default: read stdin)")
@@ -50,6 +53,7 @@ def main(argv=None):
 
     p = add("run", "run a dreaming pass over new session transcripts")
     p.add_argument("--auto", action="store_true", help="hook mode: respect the threshold and failure backoff")
+    p.add_argument("--engine", default="", help="auto | api | claude-code | codex | cursor | none (default: config)")
     p.add_argument("--force", action="store_true", help="dream even below the new-activity threshold")
     p.add_argument("--dry-run", action="store_true", help="show the result without applying or advancing the cursor")
     p.add_argument("--batches", type=int, default=1, help="process up to N batches (to drain a backlog)")
@@ -73,15 +77,22 @@ def main(argv=None):
 
     if args.command == "init":
         harnesses = [h.strip() for h in args.harness.split(",") if h.strip()] or None
-        bad = [h for h in harnesses or [] if h not in targets.FILES]
+        bad = [h for h in harnesses or [] if h not in install.HARNESSES]
         if bad:
-            print(f"[dreamer] unknown harness target(s): {', '.join(bad)} (choose from {', '.join(targets.FILES)})", file=sys.stderr)
+            print(f"[dreamer] unknown harness(es): {', '.join(bad)} (choose from {', '.join(install.HARNESSES)})", file=sys.stderr)
             return 2
         for line in install.init(root, cfg, harnesses=harnesses, git_hook=args.git_hook,
-                                 session_hook=not args.no_session_hook, with_config=args.with_config):
+                                 hooks=not args.no_hooks, with_config=args.with_config):
             print(f"[dreamer] {line}")
         files = " ".join([f"{cfg.memory.dir}/"] + [targets.FILES[k] for k in targets.installed(root)])
         print(f"[dreamer] Ready. Commit {files} to share the memory.")
+        return 0
+
+    if args.command == "capture":
+        try:
+            print(capture.handle(args.source, sys.stdin.read(), Path.cwd()))
+        except Exception:  # a hook must never break the harness
+            print(json.dumps({"continue": True}))
         return 0
 
     if args.command == "note":
@@ -160,7 +171,7 @@ def main(argv=None):
         code = 0
         for _ in range(max(1, args.batches)):
             try:
-                res = dream.run(root, cfg, auto=args.auto, force=args.force, dry_run=args.dry_run)
+                res = engines.run(root, cfg, engine=args.engine, auto=args.auto, force=args.force, dry_run=args.dry_run)
             except repo.Busy:
                 _print(args.quiet, sdir, "another pass is running; skipped")
                 break

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
-from dreamer import notes, repo, store, targets, transcripts
+from dreamer import capture, notes, repo, store, targets, transcripts
 from dreamer.config import DreamerConfig
 from dreamer.llm import DreamError, make_client, run_loop
 
@@ -135,6 +135,7 @@ def _commit(root: Path, cfg: DreamerConfig, sdir: Path, state: Dict[str, Any], b
             if Path(f).exists():
                 shutil.move(f, snap / "inbox" / Path(f).name)
     _advance(state, batch)
+    capture.prune(root, state.get("files", {}))
     state["failures"] = 0
     status = "applied" if changed else "unchanged"
     state["runs"].append({
@@ -206,7 +207,8 @@ def run(
 
 # -- agent-driven passes (any harness, any model) --------------------------------
 
-EXTERNAL_GUIDE = """You are running a memory-consolidation ("dreaming") pass for this repository.
+EXTERNAL_GUIDE = transcripts.MARKER + """
+You are running a memory-consolidation ("dreaming") pass for this repository.
 Play the role described under SYSTEM PROMPT, working on the material under USER MESSAGE.
 
 Act only through these commands, run from the repository root. Do not edit files in `{dir}/` directly.
